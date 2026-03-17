@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "medimg-preprocessor"
+version = "0.1.0"
+description = "Standalone nnU-Net-style medical image preprocessing for segmentation and generative workflows."
+readme = { file = "medimg_preprocessor/README.md", content-type = "text/markdown" }
+requires-python = ">=3.10"
+authors = [
+  { name = "J1won7" }
+]
+dependencies = [
+  "numpy>=1.23",
+  "scipy>=1.10",
+  "torch>=1.13",
+  "nibabel",
+  "SimpleITK",
+  "tifffile",
+  "scikit-image"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest"
+]
+
+[project.scripts]
+medimg-preprocess = "medimg_preprocessor.cli:medimg_preprocess"
+
+[tool.setuptools.packages.find]
+include = ["medimg_preprocessor*", "medimg_pipeline*", "standalone_preprocessing*"]
+exclude = ["*.tests", "*.tests.*"]
