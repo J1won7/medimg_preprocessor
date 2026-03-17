@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
+import os
 import re
 import sys
+from time import sleep
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -107,18 +110,53 @@ def _format_progress(current: int, total: int, width: int = 28) -> str:
 
 def _run_case_progress(
     label: str,
-    identifiers: Sequence[str],
-    runner,
+    work_items: Sequence[dict],
+    worker_fn,
+    num_processes: int,
 ) -> None:
-    total = len(identifiers)
+    total = len(work_items)
     if total == 0:
         return
-    for index, identifier in enumerate(identifiers, start=1):
-        sys.stdout.write(f"\r  {label:<12} {_format_progress(index, total)}")
+    if num_processes <= 1:
+        for index, item in enumerate(work_items, start=1):
+            sys.stdout.write(f"\r  {label:<12} {_format_progress(index, total)}")
+            sys.stdout.flush()
+            worker_fn(item)
+        sys.stdout.write("\n")
         sys.stdout.flush()
-        runner(identifier)
-    sys.stdout.write("\n")
-    sys.stdout.flush()
+        return
+
+    with multiprocessing.get_context("spawn").Pool(num_processes) as pool:
+        results = [pool.apply_async(worker_fn, (item,)) for item in work_items]
+        remaining = list(range(total))
+        workers = [j for j in pool._pool]
+        while len(remaining) > 0:
+            all_alive = all([j.is_alive() for j in workers])
+            if not all_alive:
+                raise RuntimeError(
+                    "A background preprocessing worker died unexpectedly. "
+                    "This is often caused by an exception or by running out of memory."
+                )
+            done = [i for i in remaining if results[i].ready()]
+            for i in done:
+                results[i].get()
+            completed = total - len(remaining) + len(done)
+            sys.stdout.write(f"\r  {label:<12} {_format_progress(completed, total)}")
+            sys.stdout.flush()
+            remaining = [i for i in remaining if i not in done]
+            sleep(0.1)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+def _ensure_storage_runtime(storage_format: str) -> None:
+    if storage_format == "blosc2":
+        try:
+            import blosc2  # noqa: F401
+        except ModuleNotFoundError as e:
+            raise ValueError(
+                "storage_format='blosc2' requires the 'blosc2' package, but it is not installed in the current environment."
+            ) from e
 
 
 def _load_config_from_json(path: Optional[str]) -> Optional[PreprocessingConfig]:
@@ -223,7 +261,14 @@ def _build_reader(reader_name: str, example_file: str, dataset_json_content: Opt
 
 def _prepare_output_prefix(output_folder: Path, identifier: str) -> Path:
     output_prefix = output_folder / identifier
-    if output_prefix.with_suffix(".npz").exists() or output_prefix.with_suffix(".pkl").exists():
+    existing = [
+        output_prefix.with_suffix(".npz"),
+        output_prefix.with_suffix(".pkl"),
+        output_prefix.with_suffix(".b2nd"),
+        output_folder / f"{identifier}_target.b2nd",
+        output_folder / f"{identifier}_evalref.b2nd",
+    ]
+    if any(path.exists() for path in existing):
         raise ValueError(f"Refusing to overwrite existing preprocessed case '{identifier}' in {output_folder}")
     return output_prefix
 
@@ -260,6 +305,7 @@ def _plan_config_from_cases(
     *,
     dataset_json: Optional[dict] = None,
     reference_cases: Optional[dict[str, str]] = None,
+    num_processes: int = 1,
 ) -> PreprocessingConfig:
     first_identifier = sorted(cases.keys())[0]
     reader = _build_reader(reader_name, cases[first_identifier][0], dataset_json)
@@ -268,6 +314,7 @@ def _plan_config_from_cases(
         reader,
         dataset_json=dataset_json,
         reference_cases=reference_cases,
+        num_processes=num_processes,
     )
     return config
 
@@ -378,6 +425,8 @@ def _preprocess_case(
     reference_files: Optional[list[str] | str] = None,
     reference_reader_name: Optional[str] = None,
     reference_dataset_json: Optional[dict] = None,
+    storage_format: str = "blosc2",
+    patch_size_hint: Optional[Sequence[int]] = None,
 ) -> None:
     from .preprocessing import TaskAwarePreprocessor
 
@@ -399,7 +448,16 @@ def _preprocess_case(
         reference_files=reference_files,
         reference_reader=reference_reader,
     )
-    save_preprocessed_case(case, str(_prepare_output_prefix(output_folder, identifier)))
+    save_preprocessed_case(
+        case,
+        str(_prepare_output_prefix(output_folder, identifier)),
+        storage_format=storage_format,
+        patch_size_hint=patch_size_hint,
+    )
+
+
+def _preprocess_case_worker(payload: dict) -> None:
+    _preprocess_case(**payload)
 
 
 def _preprocess_segmentation_or_self_supervised(
@@ -415,19 +473,22 @@ def _preprocess_segmentation_or_self_supervised(
         if args.labels_dir is not None:
             raise ValueError("self_supervised does not accept --labels-dir")
         identifiers = sorted(images.keys())
-
-        def _runner(identifier: str) -> None:
-            _preprocess_case(
-                identifier=identifier,
-                image_files=images[identifier],
-                image_reader_name=args.image_reader,
-                image_dataset_json=dataset_json,
-                config=config,
-                output_folder=output_folder,
-                task_mode=TaskMode.SELF_SUPERVISED,
-                run_stage=args.run_stage,
-            )
-        _run_case_progress("cases", identifiers, _runner)
+        work_items = [
+            {
+                "identifier": identifier,
+                "image_files": images[identifier],
+                "image_reader_name": args.image_reader,
+                "image_dataset_json": dataset_json,
+                "config": config,
+                "output_folder": output_folder,
+                "task_mode": TaskMode.SELF_SUPERVISED,
+                "run_stage": args.run_stage,
+                "storage_format": args.storage_format,
+                "patch_size_hint": args.default_patch_size,
+            }
+            for identifier in identifiers
+        ]
+        _run_case_progress("cases", work_items, _preprocess_case_worker, args.num_processes)
         return save_preprocessed_dataset(
             folder=str(output_folder),
             task_mode=TaskMode.SELF_SUPERVISED,
@@ -435,6 +496,7 @@ def _preprocess_segmentation_or_self_supervised(
             config=config,
             default_patch_size=args.default_patch_size,
             identifiers=identifiers,
+            storage_format=args.storage_format,
         )
 
     if args.run_stage in {RunStage.TRAIN, RunStage.PREDICT_AND_EVALUATE}:
@@ -445,22 +507,25 @@ def _preprocess_segmentation_or_self_supervised(
 
     labels = _scan_single_image_dir(args.labels_dir, "--labels-dir") if args.labels_dir is not None else None
     identifiers = sorted(images.keys()) if labels is None else _assert_matching_identifiers(images, labels, "images", "labels")
-
-    def _runner(identifier: str) -> None:
-        _preprocess_case(
-            identifier=identifier,
-            image_files=images[identifier],
-            image_reader_name=args.image_reader,
-            image_dataset_json=dataset_json,
-            config=config,
-            output_folder=output_folder,
-            task_mode=TaskMode.SEGMENTATION,
-            run_stage=args.run_stage,
-            reference_files=None if labels is None else labels[identifier][0],
-            reference_reader_name=args.reference_reader,
-            reference_dataset_json=dataset_json,
-        )
-    _run_case_progress("cases", identifiers, _runner)
+    work_items = [
+        {
+            "identifier": identifier,
+            "image_files": images[identifier],
+            "image_reader_name": args.image_reader,
+            "image_dataset_json": dataset_json,
+            "config": config,
+            "output_folder": output_folder,
+            "task_mode": TaskMode.SEGMENTATION,
+            "run_stage": args.run_stage,
+            "reference_files": None if labels is None else labels[identifier][0],
+            "reference_reader_name": args.reference_reader,
+            "reference_dataset_json": dataset_json,
+            "storage_format": args.storage_format,
+            "patch_size_hint": args.default_patch_size,
+        }
+        for identifier in identifiers
+    ]
+    _run_case_progress("cases", work_items, _preprocess_case_worker, args.num_processes)
     return save_preprocessed_dataset(
         folder=str(output_folder),
         task_mode=TaskMode.SEGMENTATION,
@@ -468,6 +533,7 @@ def _preprocess_segmentation_or_self_supervised(
         config=config,
         default_patch_size=args.default_patch_size,
         identifiers=identifiers,
+        storage_format=args.storage_format,
     )
 
 
@@ -490,22 +556,25 @@ def _preprocess_paired(args: argparse.Namespace, config: PreprocessingConfig, da
         if targets is None
         else _assert_matching_identifiers(sources, targets, "source", "target")
     )
-
-    def _runner(identifier: str) -> None:
-        _preprocess_case(
-            identifier=identifier,
-            image_files=sources[identifier],
-            image_reader_name=args.source_reader,
-            image_dataset_json=dataset_json,
-            config=config,
-            output_folder=output_folder,
-            task_mode=TaskMode.PAIRED_GENERATIVE,
-            run_stage=args.run_stage,
-            reference_files=None if targets is None else targets[identifier],
-            reference_reader_name=args.target_reader,
-            reference_dataset_json=dataset_json,
-        )
-    _run_case_progress("cases", identifiers, _runner)
+    work_items = [
+        {
+            "identifier": identifier,
+            "image_files": sources[identifier],
+            "image_reader_name": args.source_reader,
+            "image_dataset_json": dataset_json,
+            "config": config,
+            "output_folder": output_folder,
+            "task_mode": TaskMode.PAIRED_GENERATIVE,
+            "run_stage": args.run_stage,
+            "reference_files": None if targets is None else targets[identifier],
+            "reference_reader_name": args.target_reader,
+            "reference_dataset_json": dataset_json,
+            "storage_format": args.storage_format,
+            "patch_size_hint": args.default_patch_size,
+        }
+        for identifier in identifiers
+    ]
+    _run_case_progress("cases", work_items, _preprocess_case_worker, args.num_processes)
     return save_preprocessed_dataset(
         folder=str(output_folder),
         task_mode=TaskMode.PAIRED_GENERATIVE,
@@ -513,6 +582,7 @@ def _preprocess_paired(args: argparse.Namespace, config: PreprocessingConfig, da
         config=config,
         default_patch_size=args.default_patch_size,
         identifiers=identifiers,
+        storage_format=args.storage_format,
     )
 
 
@@ -540,31 +610,38 @@ def _preprocess_unpaired(
 
     identifiers_a = sorted(domain_a.keys())
     identifiers_b = sorted(domain_b.keys())
-
-    def _runner_a(identifier: str) -> None:
-        _preprocess_case(
-            identifier=identifier,
-            image_files=domain_a[identifier],
-            image_reader_name=args.domain_a_reader,
-            image_dataset_json=dataset_json_a,
-            config=config_a,
-            output_folder=folder_a,
-            task_mode=TaskMode.UNPAIRED_GENERATIVE,
-            run_stage=args.run_stage,
-        )
-    def _runner_b(identifier: str) -> None:
-        _preprocess_case(
-            identifier=identifier,
-            image_files=domain_b[identifier],
-            image_reader_name=args.domain_b_reader,
-            image_dataset_json=dataset_json_b,
-            config=config_b,
-            output_folder=folder_b,
-            task_mode=TaskMode.UNPAIRED_GENERATIVE,
-            run_stage=args.run_stage,
-        )
-    _run_case_progress("domain A", identifiers_a, _runner_a)
-    _run_case_progress("domain B", identifiers_b, _runner_b)
+    work_items_a = [
+        {
+            "identifier": identifier,
+            "image_files": domain_a[identifier],
+            "image_reader_name": args.domain_a_reader,
+            "image_dataset_json": dataset_json_a,
+            "config": config_a,
+            "output_folder": folder_a,
+            "task_mode": TaskMode.UNPAIRED_GENERATIVE,
+            "run_stage": args.run_stage,
+            "storage_format": args.storage_format,
+            "patch_size_hint": args.default_patch_size,
+        }
+        for identifier in identifiers_a
+    ]
+    work_items_b = [
+        {
+            "identifier": identifier,
+            "image_files": domain_b[identifier],
+            "image_reader_name": args.domain_b_reader,
+            "image_dataset_json": dataset_json_b,
+            "config": config_b,
+            "output_folder": folder_b,
+            "task_mode": TaskMode.UNPAIRED_GENERATIVE,
+            "run_stage": args.run_stage,
+            "storage_format": args.storage_format,
+            "patch_size_hint": args.default_patch_size,
+        }
+        for identifier in identifiers_b
+    ]
+    _run_case_progress("domain A", work_items_a, _preprocess_case_worker, args.num_processes)
+    _run_case_progress("domain B", work_items_b, _preprocess_case_worker, args.num_processes)
 
     return save_preprocessed_dataset(
         folder=str(output_folder),
@@ -577,11 +654,13 @@ def _preprocess_unpaired(
         config_b=config_b,
         identifiers_a=identifiers_a,
         identifiers_b=identifiers_b,
+        storage_format=args.storage_format,
     )
 
 
 def _preprocess_dataset_command(args: argparse.Namespace) -> int:
     total_steps = 4
+    _ensure_storage_runtime(args.storage_format)
     _log_stage(1, total_steps, "Scan dataset", f"task_mode={args.task_mode}")
     base_config = _load_config(args.config_json, args.plans_file, args.configuration_name)
     config_a = _load_config(args.config_a_json, args.plans_a_file, args.configuration_a_name)
@@ -601,12 +680,14 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                 domain_a,
                 args.domain_a_reader,
                 dataset_json=dataset_json_a,
+                num_processes=args.num_processes,
             )
         if config_b is None:
             config_b = _plan_config_from_cases(
                 domain_b,
                 args.domain_b_reader,
                 dataset_json=dataset_json_b,
+                num_processes=args.num_processes,
             )
         _log_stage(3, total_steps, "Preprocess cases", "writing preprocessed domain folders")
         manifest_file = _preprocess_unpaired(args, config_a, config_b, dataset_json_a, dataset_json_b)
@@ -637,6 +718,7 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                     args.image_reader,
                     dataset_json=dataset_json,
                     reference_cases=labels,
+                    num_processes=args.num_processes,
                 )
             _log_stage(3, total_steps, "Preprocess cases", "writing preprocessed case files")
             manifest_file = _preprocess_segmentation_or_self_supervised(args, base_config, dataset_json)
@@ -663,6 +745,7 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                     sources,
                     args.source_reader,
                     dataset_json=dataset_json,
+                    num_processes=args.num_processes,
                 )
             _log_stage(3, total_steps, "Preprocess cases", "writing preprocessed case files")
             manifest_file = _preprocess_paired(args, base_config, dataset_json)
@@ -675,6 +758,7 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
 
 
 def _save_dataset_command(args: argparse.Namespace) -> int:
+    _ensure_storage_runtime(args.storage_format)
     config = _load_config(args.config_json, args.plans_file, args.configuration_name)
     config_a = _load_config(args.config_a_json, args.plans_a_file, args.configuration_a_name)
     config_b = _load_config(args.config_b_json, args.plans_b_file, args.configuration_b_name)
@@ -690,6 +774,7 @@ def _save_dataset_command(args: argparse.Namespace) -> int:
         config_a=config_a,
         config_b=config_b,
         random_pairing=not args.disable_random_pairing,
+        storage_format=args.storage_format,
     )
     print(Path(manifest_file).resolve())
     return 0
@@ -776,6 +861,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="DIM",
         help="Default patch size written into the generated manifest.",
+    )
+    preprocess_parser.add_argument(
+        "--storage-format",
+        choices=("blosc2", "npz"),
+        default="blosc2",
+        help="Storage format for saved cases. Default: blosc2.",
+    )
+    preprocess_parser.add_argument(
+        "--num-processes",
+        type=int,
+        default=max(1, (os.cpu_count() or 1) // 2),
+        help="Number of worker processes for planning and preprocessing. Default: half of available CPUs.",
     )
     preprocess_parser.add_argument(
         "--multi-image",
@@ -921,6 +1018,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="DIM",
         help="Default patch size stored in the manifest, for example: --default-patch-size 96 96 96",
+    )
+    save_parser.add_argument(
+        "--storage-format",
+        choices=("blosc2", "npz"),
+        default="blosc2",
+        help="Storage format recorded in the manifest. Default: blosc2.",
     )
     domain_group = save_parser.add_argument_group("unpaired dataset options")
     domain_group.add_argument(

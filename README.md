@@ -22,6 +22,7 @@ It includes:
 - anisotropy-aware target spacing and resampling
 - channel-name-based normalization selection when `dataset.json` is available
 - saved preprocessed cases and manifest-based dataset loading
+- `blosc2` as the default on-disk storage format for faster preprocessing output and dataset loading
 
 ## Install
 
@@ -34,6 +35,7 @@ Main runtime dependencies are declared in the package:
 - `numpy`
 - `scipy`
 - `torch`
+- `blosc2`
 - `nibabel`
 - `SimpleITK`
 - `tifffile`
@@ -59,7 +61,8 @@ python -m medimg_preprocessor preprocess-dataset \
   --task-mode segmentation \
   --images-dir imagesTr \
   --labels-dir labelsTr \
-  --output-folder preprocessed
+  --output-folder preprocessed \
+  --num-processes 8
 ```
 
 ### Paired Generative
@@ -217,15 +220,42 @@ For unpaired generative, you may provide:
 - one shared config with `--config-json`
 - separate configs with `--config-a-json` and `--config-b-json`
 
+## Storage Format
+
+Saved cases use `blosc2` by default.
+
+That means new datasets are normally written as:
+
+- `case_0001.b2nd`
+- optional `case_0001_target.b2nd`
+- optional `case_0001_evalref.b2nd`
+- `case_0001.pkl`
+
+If needed, you can still force the older NumPy archive format:
+
+```bash
+--storage-format npz
+```
+
+## Parallel Processing
+
+Planning and preprocessing can run with multiple worker processes:
+
+```bash
+--num-processes 8
+```
+
+If omitted, the CLI uses half of the available CPU cores by default.
+
 ## Output Structure
 
 ### Single-folder tasks
 
 ```text
 preprocessed/
-  case_0001.npz
+  case_0001.b2nd
   case_0001.pkl
-  case_0002.npz
+  case_0002.b2nd
   case_0002.pkl
   preprocessing_manifest.json
 ```
@@ -235,10 +265,10 @@ preprocessed/
 ```text
 preprocessed_unpaired/
   domain_a/
-    a_0001.npz
+    a_0001.b2nd
     a_0001.pkl
   domain_b/
-    b_0001.npz
+    b_0001.b2nd
     b_0001.pkl
   preprocessing_manifest.json
 ```

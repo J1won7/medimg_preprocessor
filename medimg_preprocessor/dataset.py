@@ -4,10 +4,15 @@ from dataclasses import asdict
 import json
 import os
 import pickle
+import math
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 import warnings
 
 import numpy as np
+try:
+    import blosc2
+except ModuleNotFoundError:
+    blosc2 = None
 try:
     import torch
     from torch.utils.data import Dataset
@@ -22,6 +27,7 @@ from .preprocessing import RunStage, TaskMode, TaskPreprocessedCase
 
 
 MANIFEST_FILENAME = "preprocessing_manifest.json"
+DEFAULT_STORAGE_FORMAT = "blosc2"
 
 
 def _fail_validation(message: str) -> None:
@@ -32,6 +38,11 @@ def _fail_validation(message: str) -> None:
 def _require_torch() -> None:
     if torch is None:
         _fail_validation("torch is required for dataset loading and tensor conversion")
+
+
+def _require_blosc2() -> None:
+    if blosc2 is None:
+        _fail_validation("blosc2 is required for the default preprocessed storage format")
 
 
 def _serialize_config(config: Optional[PreprocessingConfig]) -> Optional[dict]:
@@ -72,7 +83,81 @@ def _read_json(filename: str) -> dict:
     return payload
 
 
-def save_preprocessed_case(case: TaskPreprocessedCase, output_filename_truncated: str) -> None:
+def _validate_storage_format(storage_format: str) -> str:
+    storage_format = str(storage_format).lower()
+    if storage_format not in {"blosc2", "npz"}:
+        _fail_validation(f"Unsupported storage format '{storage_format}'")
+    return storage_format
+
+
+def _comp_blosc2_params(
+    image_size: Sequence[int],
+    patch_size: Optional[Sequence[int]],
+    bytes_per_pixel: int,
+    l1_cache_size_per_core_in_bytes: int = 32768,
+    l3_cache_size_per_core_in_bytes: int = 1441792,
+    safety_factor: float = 0.8,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    image_size = tuple(int(i) for i in image_size)
+    if patch_size is None:
+        patch_size = image_size[1:]
+    if len(patch_size) == 2:
+        patch_size = [1, *patch_size]
+    patch_size = np.array(patch_size)
+    num_channels = image_size[0]
+    block_size = np.array((num_channels, *[2 ** (max(0, math.ceil(math.log2(i)))) for i in patch_size]))
+
+    estimated_nbytes_block = np.prod(block_size) * bytes_per_pixel
+    while estimated_nbytes_block > (l1_cache_size_per_core_in_bytes * safety_factor):
+        axis_order = np.argsort(block_size[1:] / patch_size)[::-1]
+        idx = 0
+        picked_axis = axis_order[idx]
+        while block_size[picked_axis + 1] == 1:
+            idx += 1
+            picked_axis = axis_order[idx]
+        block_size[picked_axis + 1] = 2 ** (max(0, math.floor(math.log2(block_size[picked_axis + 1] - 1))))
+        block_size[picked_axis + 1] = min(block_size[picked_axis + 1], image_size[picked_axis + 1])
+        estimated_nbytes_block = np.prod(block_size) * bytes_per_pixel
+
+    block_size = np.array([min(i, j) for i, j in zip(image_size, block_size)])
+    chunk_size = block_size.copy()
+    estimated_nbytes_chunk = np.prod(chunk_size) * bytes_per_pixel
+    while estimated_nbytes_chunk < (l3_cache_size_per_core_in_bytes * safety_factor):
+        if patch_size[0] == 1 and all([i == j for i, j in zip(chunk_size[2:], image_size[2:])]):
+            break
+        if all([i == j for i, j in zip(chunk_size, image_size)]):
+            break
+        axis_order = np.argsort(chunk_size[1:] / block_size[1:])
+        idx = 0
+        picked_axis = axis_order[idx]
+        while chunk_size[picked_axis + 1] == image_size[picked_axis + 1] or patch_size[picked_axis] == 1:
+            idx += 1
+            picked_axis = axis_order[idx]
+        chunk_size[picked_axis + 1] += block_size[picked_axis + 1]
+        chunk_size[picked_axis + 1] = min(chunk_size[picked_axis + 1], image_size[picked_axis + 1])
+        estimated_nbytes_chunk = np.prod(chunk_size) * bytes_per_pixel
+        if np.mean([i / j for i, j in zip(chunk_size[1:], patch_size)]) > 1.5:
+            chunk_size[picked_axis + 1] -= block_size[picked_axis + 1]
+            break
+    chunk_size = [min(i, j) for i, j in zip(image_size, chunk_size)]
+    return tuple(block_size), tuple(chunk_size)
+
+
+def _save_blosc2_array(array: np.ndarray, filename: str, patch_size: Optional[Sequence[int]]) -> None:
+    _require_blosc2()
+    blosc2.set_nthreads(1)
+    blocks, chunks = _comp_blosc2_params(array.shape, patch_size, array.itemsize)
+    cparams = {"codec": blosc2.Codec.ZSTD, "clevel": 8}
+    blosc2.asarray(np.ascontiguousarray(array), urlpath=filename, chunks=chunks, blocks=blocks, cparams=cparams)
+
+
+def save_preprocessed_case(
+    case: TaskPreprocessedCase,
+    output_filename_truncated: str,
+    *,
+    storage_format: str = DEFAULT_STORAGE_FORMAT,
+    patch_size_hint: Optional[Sequence[int]] = None,
+) -> None:
     if not isinstance(case, TaskPreprocessedCase):
         _fail_validation(f"case must be a TaskPreprocessedCase, got {type(case).__name__}")
     if not isinstance(case.image, np.ndarray):
@@ -95,12 +180,28 @@ def save_preprocessed_case(case: TaskPreprocessedCase, output_filename_truncated
             "case.evaluation_reference spatial shape must match image, "
             f"got {case.evaluation_reference.shape[1:]} and {case.image.shape[1:]}"
         )
-    arrays = {"image": np.ascontiguousarray(case.image)}
-    if case.target is not None:
-        arrays["target"] = np.ascontiguousarray(case.target)
-    if case.evaluation_reference is not None:
-        arrays["evaluation_reference"] = np.ascontiguousarray(case.evaluation_reference)
-    np.savez_compressed(output_filename_truncated + ".npz", **arrays)
+    storage_format = _validate_storage_format(storage_format)
+    if storage_format == "npz":
+        arrays = {"image": np.ascontiguousarray(case.image)}
+        if case.target is not None:
+            arrays["target"] = np.ascontiguousarray(case.target)
+        if case.evaluation_reference is not None:
+            arrays["evaluation_reference"] = np.ascontiguousarray(case.evaluation_reference)
+        np.savez_compressed(output_filename_truncated + ".npz", **arrays)
+    else:
+        _save_blosc2_array(np.ascontiguousarray(case.image), output_filename_truncated + ".b2nd", patch_size_hint)
+        if case.target is not None:
+            _save_blosc2_array(
+                np.ascontiguousarray(case.target),
+                output_filename_truncated + "_target.b2nd",
+                patch_size_hint,
+            )
+        if case.evaluation_reference is not None:
+            _save_blosc2_array(
+                np.ascontiguousarray(case.evaluation_reference),
+                output_filename_truncated + "_evalref.b2nd",
+                patch_size_hint,
+            )
     metadata = {
         "properties": case.properties,
         "target_properties": case.target_properties,
@@ -108,6 +209,7 @@ def save_preprocessed_case(case: TaskPreprocessedCase, output_filename_truncated
         "task_mode": case.task_mode,
         "run_stage": case.run_stage,
         "reference_type": case.reference_type,
+        "storage_format": storage_format,
     }
     with open(output_filename_truncated + ".pkl", "wb") as f:
         pickle.dump(metadata, f)
@@ -121,6 +223,7 @@ def save_preprocessed_dataset_manifest(
     config: Optional[PreprocessingConfig] = None,
     default_patch_size: Optional[Sequence[int]] = None,
     identifiers: Optional[Sequence[str]] = None,
+    storage_format: str = DEFAULT_STORAGE_FORMAT,
 ) -> str:
     if not os.path.isdir(folder):
         _fail_validation(f"Preprocessed dataset folder does not exist: {folder}")
@@ -133,6 +236,7 @@ def save_preprocessed_dataset_manifest(
         "task_mode": task_mode,
         "run_stage": run_stage,
         "dataset_kind": "single_folder",
+        "storage_format": _validate_storage_format(storage_format),
         "default_patch_size": None if default_patch_size is None else [int(i) for i in default_patch_size],
         "identifiers": list(identifiers) if identifiers is not None else _list_identifiers(folder),
         "preprocessing_config": _serialize_config(config),
@@ -157,8 +261,10 @@ def save_preprocessed_dataset(
     identifiers_a: Optional[Sequence[str]] = None,
     identifiers_b: Optional[Sequence[str]] = None,
     random_pairing: bool = True,
+    storage_format: str = DEFAULT_STORAGE_FORMAT,
 ) -> str:
     _validate_task_mode(task_mode)
+    storage_format = _validate_storage_format(storage_format)
     if task_mode == TaskMode.UNPAIRED_GENERATIVE:
         if folder_a is None or folder_b is None:
             _fail_validation("unpaired_generative save_preprocessed_dataset requires folder_a and folder_b")
@@ -173,6 +279,7 @@ def save_preprocessed_dataset(
             identifiers_a=identifiers_a,
             identifiers_b=identifiers_b,
             random_pairing=random_pairing,
+            storage_format=storage_format,
         )
     if folder_a is not None or folder_b is not None:
         _fail_validation(f"{task_mode} save_preprocessed_dataset does not accept folder_a/folder_b")
@@ -187,6 +294,7 @@ def save_preprocessed_dataset(
         config=config,
         default_patch_size=default_patch_size,
         identifiers=identifiers,
+        storage_format=storage_format,
     )
 
 
@@ -202,6 +310,7 @@ def save_unpaired_preprocessed_dataset_manifest(
     identifiers_a: Optional[Sequence[str]] = None,
     identifiers_b: Optional[Sequence[str]] = None,
     random_pairing: bool = True,
+    storage_format: str = DEFAULT_STORAGE_FORMAT,
 ) -> str:
     if not os.path.isdir(root_folder):
         _fail_validation(f"Preprocessed dataset root folder does not exist: {root_folder}")
@@ -219,6 +328,7 @@ def save_unpaired_preprocessed_dataset_manifest(
         "task_mode": TaskMode.UNPAIRED_GENERATIVE,
         "run_stage": run_stage,
         "dataset_kind": "unpaired_domains",
+        "storage_format": _validate_storage_format(storage_format),
         "default_patch_size": None if default_patch_size is None else [int(i) for i in default_patch_size],
         "random_pairing": bool(random_pairing),
         "domains": {
@@ -259,6 +369,8 @@ def load_preprocessed_dataset_manifest(folder: str) -> dict:
     _validate_run_stage(run_stage)
     if dataset_kind not in {"single_folder", "unpaired_domains"}:
         _fail_validation(f"Unsupported dataset_kind '{dataset_kind}' in manifest")
+    storage_format = manifest.get("storage_format", DEFAULT_STORAGE_FORMAT)
+    _validate_storage_format(storage_format)
     if task_mode == TaskMode.UNPAIRED_GENERATIVE and dataset_kind != "unpaired_domains":
         _fail_validation("unpaired_generative manifest must use dataset_kind 'unpaired_domains'")
     if task_mode != TaskMode.UNPAIRED_GENERATIVE and dataset_kind != "single_folder":
@@ -289,49 +401,80 @@ def load_preprocessed_dataset_manifest(folder: str) -> dict:
 def load_preprocessed_case(folder: str, identifier: str) -> dict:
     if not os.path.isdir(folder):
         _fail_validation(f"Preprocessed case folder does not exist: {folder}")
+    b2nd_image_file = os.path.join(folder, identifier + ".b2nd")
+    b2nd_target_file = os.path.join(folder, identifier + "_target.b2nd")
+    b2nd_eval_file = os.path.join(folder, identifier + "_evalref.b2nd")
     npz_file = os.path.join(folder, identifier + ".npz")
     pkl_file = os.path.join(folder, identifier + ".pkl")
-    if not os.path.isfile(npz_file):
-        _fail_validation(f"Preprocessed array file does not exist: {npz_file}")
+    has_blosc2 = os.path.isfile(b2nd_image_file)
+    has_npz = os.path.isfile(npz_file)
+    if not has_blosc2 and not has_npz:
+        _fail_validation(f"Preprocessed array file does not exist for case '{identifier}' in {folder}")
     if not os.path.isfile(pkl_file):
         _fail_validation(f"Preprocessed metadata file does not exist: {pkl_file}")
-    with np.load(npz_file) as arrays:
-        with open(pkl_file, "rb") as f:
-            meta = pickle.load(f)
-        if "image" not in arrays.files:
-            _fail_validation(f"Preprocessed case '{identifier}' does not contain an 'image' array")
-        if not isinstance(meta, dict):
-            _fail_validation(f"Metadata for case '{identifier}' must be a dict")
+    with open(pkl_file, "rb") as f:
+        meta = pickle.load(f)
+    if not isinstance(meta, dict):
+        _fail_validation(f"Metadata for case '{identifier}' must be a dict")
+    storage_format = _validate_storage_format(meta.get("storage_format", "blosc2" if has_blosc2 else "npz"))
+    if storage_format == "blosc2":
+        _require_blosc2()
+        blosc2.set_nthreads(1)
+        dparams = {"nthreads": 1}
+        mmap_kwargs = {} if os.name == "nt" else {"mmap_mode": "r"}
+        image = blosc2.open(urlpath=b2nd_image_file, mode="r", dparams=dparams, **mmap_kwargs)
+        target = blosc2.open(urlpath=b2nd_target_file, mode="r", dparams=dparams, **mmap_kwargs) if os.path.isfile(b2nd_target_file) else None
+        evaluation_reference = (
+            blosc2.open(urlpath=b2nd_eval_file, mode="r", dparams=dparams, **mmap_kwargs)
+            if os.path.isfile(b2nd_eval_file)
+            else None
+        )
         case = {
-            "image": arrays["image"],
-            "target": arrays["target"] if "target" in arrays.files else None,
-            "evaluation_reference": arrays["evaluation_reference"]
-            if "evaluation_reference" in arrays.files
-            else None,
+            "image": image,
+            "target": target,
+            "evaluation_reference": evaluation_reference,
             **meta,
         }
-        if "properties" not in case or not isinstance(case["properties"], dict):
-            _fail_validation(f"Metadata for case '{identifier}' must contain a dict 'properties'")
-        if case["target"] is not None and tuple(case["target"].shape[1:]) != tuple(case["image"].shape[1:]):
-            _fail_validation(
-                f"Preprocessed case '{identifier}' has mismatched image/target shapes: "
-                f"{case['image'].shape[1:]} vs {case['target'].shape[1:]}"
-            )
-        if (
-            case["evaluation_reference"] is not None
-            and tuple(case["evaluation_reference"].shape[1:]) != tuple(case["image"].shape[1:])
-        ):
-            _fail_validation(
-                f"Preprocessed case '{identifier}' has mismatched image/evaluation_reference shapes: "
-                f"{case['image'].shape[1:]} vs {case['evaluation_reference'].shape[1:]}"
-            )
-        return case
+    else:
+        with np.load(npz_file) as arrays:
+            if "image" not in arrays.files:
+                _fail_validation(f"Preprocessed case '{identifier}' does not contain an 'image' array")
+            case = {
+                "image": arrays["image"],
+                "target": arrays["target"] if "target" in arrays.files else None,
+                "evaluation_reference": arrays["evaluation_reference"]
+                if "evaluation_reference" in arrays.files
+                else None,
+                **meta,
+            }
+    if "properties" not in case or not isinstance(case["properties"], dict):
+        _fail_validation(f"Metadata for case '{identifier}' must contain a dict 'properties'")
+    if case["target"] is not None and tuple(case["target"].shape[1:]) != tuple(case["image"].shape[1:]):
+        _fail_validation(
+            f"Preprocessed case '{identifier}' has mismatched image/target shapes: "
+            f"{case['image'].shape[1:]} vs {case['target'].shape[1:]}"
+        )
+    if (
+        case["evaluation_reference"] is not None
+        and tuple(case["evaluation_reference"].shape[1:]) != tuple(case["image"].shape[1:])
+    ):
+        _fail_validation(
+            f"Preprocessed case '{identifier}' has mismatched image/evaluation_reference shapes: "
+            f"{case['image'].shape[1:]} vs {case['evaluation_reference'].shape[1:]}"
+        )
+    return case
 
 
 def _list_identifiers(folder: str) -> list[str]:
     if not os.path.isdir(folder):
         _fail_validation(f"Preprocessed dataset folder does not exist: {folder}")
-    return sorted([os.path.splitext(i)[0] for i in os.listdir(folder) if i.endswith(".npz")])
+    identifiers = set()
+    for name in os.listdir(folder):
+        if name.endswith(".npz"):
+            identifiers.add(os.path.splitext(name)[0])
+        elif name.endswith(".b2nd") and not name.endswith("_target.b2nd") and not name.endswith("_evalref.b2nd"):
+            identifiers.add(name[:-5])
+    return sorted(identifiers)
 
 
 def _validate_patch_dims(array: np.ndarray, patch_size: Optional[Sequence[int]], context: str) -> None:

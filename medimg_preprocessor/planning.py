@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import multiprocessing
 from typing import Dict, Optional, Sequence
 import warnings
 
@@ -147,58 +148,76 @@ def collect_nonzero_intensities(
     return intensities_per_channel, intensity_statistics_per_channel
 
 
+def _fingerprint_case_worker(payload: dict) -> tuple[tuple[int, ...], tuple[float, ...], list[np.ndarray], float]:
+    reader_class = payload["reader_class"]
+    reader = reader_class()
+    identifier = payload["identifier"]
+    images, properties_images = reader.read_images(tuple(payload["image_files"]))
+    spacing = properties_images["spacing"]
+
+    reference_cases = payload.get("reference_cases")
+    num_samples = int(payload["num_samples"])
+    if reference_cases is not None:
+        reference = reference_cases[identifier]
+        if isinstance(reference, str):
+            segmentation, _ = reader.read_seg(reference)
+        else:
+            if len(reference) != 1:
+                _fail_validation(f"Segmentation planning expects exactly one reference file per case, got {reference}")
+            segmentation, _ = reader.read_seg(reference[0])
+        data_cropped, seg_cropped, _ = crop_to_nonzero(images, segmentation)
+        foreground_intensities_per_channel, _ = collect_foreground_intensities(
+            seg_cropped,
+            data_cropped,
+            num_samples=num_samples,
+        )
+    else:
+        data_cropped, mask_reference, _ = crop_to_nonzero(images, None)
+        foreground_mask = mask_reference[0] >= 0
+        foreground_intensities_per_channel, _ = collect_nonzero_intensities(
+            data_cropped,
+            foreground_mask,
+            num_samples=num_samples,
+        )
+
+    shape_before_crop = images.shape[1:]
+    shape_after_crop = data_cropped.shape[1:]
+    relative_size_after_cropping = np.prod(shape_after_crop) / np.prod(shape_before_crop)
+    return (
+        tuple(int(i) for i in shape_after_crop),
+        tuple(float(i) for i in spacing),
+        foreground_intensities_per_channel,
+        float(relative_size_after_cropping),
+    )
+
+
 def extract_fingerprint_from_cases(
     cases: dict[str, list[str]],
     reader,
     *,
     reference_cases: Optional[dict[str, Sequence[str] | str]] = None,
     num_foreground_samples_total: int = int(10e7),
+    num_processes: int = 1,
 ) -> dict:
     if len(cases) == 0:
         _fail_validation("extract_fingerprint_from_cases requires at least one case")
 
     num_samples_per_case = int(num_foreground_samples_total // len(cases))
-    results = []
-
-    for identifier in sorted(cases.keys()):
-        images, properties_images = reader.read_images(tuple(cases[identifier]))
-        spacing = properties_images["spacing"]
-        if reference_cases is not None:
-            reference = reference_cases[identifier]
-            if isinstance(reference, str):
-                segmentation, _ = reader.read_seg(reference)
-            else:
-                if len(reference) != 1:
-                    _fail_validation(
-                        f"Segmentation planning expects exactly one reference file per case, got {reference}"
-                    )
-                segmentation, _ = reader.read_seg(reference[0])
-            data_cropped, seg_cropped, _ = crop_to_nonzero(images, segmentation)
-            foreground_intensities_per_channel, _ = collect_foreground_intensities(
-                seg_cropped,
-                data_cropped,
-                num_samples=num_samples_per_case,
-            )
-        else:
-            data_cropped, mask_reference, _ = crop_to_nonzero(images, None)
-            foreground_mask = mask_reference[0] >= 0
-            foreground_intensities_per_channel, _ = collect_nonzero_intensities(
-                data_cropped,
-                foreground_mask,
-                num_samples=num_samples_per_case,
-            )
-
-        shape_before_crop = images.shape[1:]
-        shape_after_crop = data_cropped.shape[1:]
-        relative_size_after_cropping = np.prod(shape_after_crop) / np.prod(shape_before_crop)
-        results.append(
-            (
-                tuple(int(i) for i in shape_after_crop),
-                tuple(float(i) for i in spacing),
-                foreground_intensities_per_channel,
-                float(relative_size_after_cropping),
-            )
-        )
+    payloads = [
+        {
+            "identifier": identifier,
+            "image_files": cases[identifier],
+            "reference_cases": reference_cases,
+            "reader_class": reader.__class__,
+            "num_samples": num_samples_per_case,
+        }
+        for identifier in sorted(cases.keys())
+    ]
+    if num_processes > 1:
+        with multiprocessing.get_context("spawn").Pool(num_processes) as pool:
+            results = pool.map(_fingerprint_case_worker, payloads)
+    else:
+        results = [_fingerprint_case_worker(payload) for payload in payloads]
 
     shapes_after_crop = [r[0] for r in results]
     spacings = [r[1] for r in results]
@@ -318,8 +337,14 @@ def plan_preprocessing_from_cases(
     reference_cases: Optional[dict[str, Sequence[str] | str]] = None,
     suppress_transpose: bool = False,
     overwrite_target_spacing: Optional[Sequence[float]] = None,
+    num_processes: int = 1,
 ) -> tuple[PreprocessingConfig, dict]:
-    fingerprint = extract_fingerprint_from_cases(cases, reader, reference_cases=reference_cases)
+    fingerprint = extract_fingerprint_from_cases(
+        cases,
+        reader,
+        reference_cases=reference_cases,
+        num_processes=num_processes,
+    )
     first_identifier = sorted(cases.keys())[0]
     num_channels = len(reader.read_images(tuple(cases[first_identifier]))[0])
 
