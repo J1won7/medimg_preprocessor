@@ -20,23 +20,25 @@ from .planning import plan_preprocessing_from_cases
 from .preprocessing import RunStage, TaskMode
 
 
-DESCRIPTION = """Manage medimg_preprocessor datasets and manifests.
+DESCRIPTION = """medimg_preprocessor CLI
 
-This CLI supports two workflows:
+주요 명령:
 
 1. preprocess-dataset
-   Scan raw data directories, preprocess matching cases, save .npz/.pkl cases,
-   and write preprocessing_manifest.json. If no config or plans are provided,
-   preprocessing settings are determined automatically from the dataset in an
-   nnU-Net-style fingerprint/planning step.
+   raw 디렉토리를 스캔하고, 자동 planning 후 전처리 결과와
+   preprocessing_manifest.json을 생성합니다.
+   config나 plans를 따로 주지 않으면 nnU-Net 스타일로 자동 결정합니다.
 
 2. save-dataset
-   Write preprocessing_manifest.json for a dataset whose preprocessed case
-   files already exist on disk.
+   이미 저장된 전처리 case 파일들에 대해
+   preprocessing_manifest.json만 다시 생성합니다.
+
+3. show-manifest
+   저장된 preprocessing_manifest.json 내용을 출력합니다.
 """
 
 
-PREPROCESS_DATASET_EPILOG = """Examples:
+PREPROCESS_DATASET_EPILOG = """예시:
   Segmentation:
     python -m medimg_preprocessor preprocess-dataset --task-mode segmentation --images-dir raw/imagesTr --labels-dir raw/labelsTr --output-folder preprocessed_seg
 
@@ -51,7 +53,7 @@ PREPROCESS_DATASET_EPILOG = """Examples:
 """
 
 
-SAVE_DATASET_EPILOG = """Examples:
+SAVE_DATASET_EPILOG = """예시:
   Single-folder segmentation dataset:
     python -m medimg_preprocessor save-dataset --folder preprocessed_seg --task-mode segmentation --run-stage train --plans-file nnUNetPlans.json --configuration-name 3d_fullres --default-patch-size 96 96 96
 
@@ -63,7 +65,7 @@ SAVE_DATASET_EPILOG = """Examples:
 """
 
 
-SHOW_MANIFEST_EPILOG = """Example:
+SHOW_MANIFEST_EPILOG = """예시:
   python -m medimg_preprocessor show-manifest --folder preprocessed_seg
 """
 
@@ -306,17 +308,51 @@ def _plan_config_from_cases(
     dataset_json: Optional[dict] = None,
     reference_cases: Optional[dict[str, str]] = None,
     num_processes: int = 1,
-) -> PreprocessingConfig:
+) -> tuple[PreprocessingConfig, dict]:
     first_identifier = sorted(cases.keys())[0]
     reader = _build_reader(reader_name, cases[first_identifier][0], dataset_json)
-    config, _ = plan_preprocessing_from_cases(
+    return plan_preprocessing_from_cases(
         cases,
         reader,
         dataset_json=dataset_json,
         reference_cases=reference_cases,
         num_processes=num_processes,
     )
-    return config
+
+
+def _resolve_default_configuration(configurations: Optional[dict]) -> Optional[str]:
+    if not configurations:
+        return None
+    if "3d" in configurations:
+        return "3d"
+    if "2d" in configurations:
+        return "2d"
+    return next(iter(configurations.keys()))
+
+
+def _merge_unpaired_configurations(configurations_a: Optional[dict], configurations_b: Optional[dict]) -> Optional[dict]:
+    if not configurations_a and not configurations_b:
+        return None
+    if not configurations_a:
+        return configurations_b
+    if not configurations_b:
+        return configurations_a
+    shared = {}
+    for name in sorted(set(configurations_a.keys()).intersection(configurations_b.keys())):
+        patch_a = configurations_a[name].get("patch_size")
+        patch_b = configurations_b[name].get("patch_size")
+        if patch_a is None or patch_b is None or len(patch_a) != len(patch_b):
+            continue
+        shared[name] = {
+            "patch_size": [min(int(a), int(b)) for a, b in zip(patch_a, patch_b)],
+            "spacing": configurations_a[name].get("spacing"),
+            "median_shape": configurations_a[name].get("median_shape"),
+            "recommended_batch_size": min(
+                int(configurations_a[name].get("recommended_batch_size", 2)),
+                int(configurations_b[name].get("recommended_batch_size", 2)),
+            ),
+        }
+    return shared or configurations_a
 
 
 def _list_supported_files(folder: str, label: str) -> list[Path]:
@@ -464,6 +500,9 @@ def _preprocess_segmentation_or_self_supervised(
     args: argparse.Namespace,
     config: PreprocessingConfig,
     dataset_json: Optional[dict],
+    default_patch_size: Optional[Sequence[int]],
+    default_configuration: Optional[str],
+    configurations: Optional[dict],
 ) -> str:
     images = _scan_image_dir(args.images_dir, "--images-dir", args.multi_image)
     output_folder = Path(args.output_folder)
@@ -484,7 +523,7 @@ def _preprocess_segmentation_or_self_supervised(
                 "task_mode": TaskMode.SELF_SUPERVISED,
                 "run_stage": args.run_stage,
                 "storage_format": args.storage_format,
-                "patch_size_hint": args.default_patch_size,
+                "patch_size_hint": default_patch_size,
             }
             for identifier in identifiers
         ]
@@ -494,7 +533,9 @@ def _preprocess_segmentation_or_self_supervised(
             task_mode=TaskMode.SELF_SUPERVISED,
             run_stage=args.run_stage,
             config=config,
-            default_patch_size=args.default_patch_size,
+            default_patch_size=default_patch_size,
+            default_configuration=default_configuration,
+            configurations=configurations,
             identifiers=identifiers,
             storage_format=args.storage_format,
         )
@@ -521,7 +562,7 @@ def _preprocess_segmentation_or_self_supervised(
             "reference_reader_name": args.reference_reader,
             "reference_dataset_json": dataset_json,
             "storage_format": args.storage_format,
-            "patch_size_hint": args.default_patch_size,
+            "patch_size_hint": default_patch_size,
         }
         for identifier in identifiers
     ]
@@ -531,13 +572,22 @@ def _preprocess_segmentation_or_self_supervised(
         task_mode=TaskMode.SEGMENTATION,
         run_stage=args.run_stage,
         config=config,
-        default_patch_size=args.default_patch_size,
+        default_patch_size=default_patch_size,
+        default_configuration=default_configuration,
+        configurations=configurations,
         identifiers=identifiers,
         storage_format=args.storage_format,
     )
 
 
-def _preprocess_paired(args: argparse.Namespace, config: PreprocessingConfig, dataset_json: Optional[dict]) -> str:
+def _preprocess_paired(
+    args: argparse.Namespace,
+    config: PreprocessingConfig,
+    dataset_json: Optional[dict],
+    default_patch_size: Optional[Sequence[int]],
+    default_configuration: Optional[str],
+    configurations: Optional[dict],
+) -> str:
     if args.source_dir is None:
         raise ValueError("paired_generative requires --source-dir")
     sources = _scan_image_dir(args.source_dir, "--source-dir", args.multi_image)
@@ -570,7 +620,7 @@ def _preprocess_paired(args: argparse.Namespace, config: PreprocessingConfig, da
             "reference_reader_name": args.target_reader,
             "reference_dataset_json": dataset_json,
             "storage_format": args.storage_format,
-            "patch_size_hint": args.default_patch_size,
+            "patch_size_hint": default_patch_size,
         }
         for identifier in identifiers
     ]
@@ -580,7 +630,9 @@ def _preprocess_paired(args: argparse.Namespace, config: PreprocessingConfig, da
         task_mode=TaskMode.PAIRED_GENERATIVE,
         run_stage=args.run_stage,
         config=config,
-        default_patch_size=args.default_patch_size,
+        default_patch_size=default_patch_size,
+        default_configuration=default_configuration,
+        configurations=configurations,
         identifiers=identifiers,
         storage_format=args.storage_format,
     )
@@ -592,6 +644,9 @@ def _preprocess_unpaired(
     config_b: PreprocessingConfig,
     dataset_json_a: Optional[dict],
     dataset_json_b: Optional[dict],
+    default_patch_size: Optional[Sequence[int]],
+    default_configuration: Optional[str],
+    configurations: Optional[dict],
 ) -> str:
     if args.domain_a_dir is None or args.domain_b_dir is None:
         raise ValueError("unpaired_generative requires --domain-a-dir and --domain-b-dir")
@@ -621,7 +676,7 @@ def _preprocess_unpaired(
             "task_mode": TaskMode.UNPAIRED_GENERATIVE,
             "run_stage": args.run_stage,
             "storage_format": args.storage_format,
-            "patch_size_hint": args.default_patch_size,
+            "patch_size_hint": default_patch_size,
         }
         for identifier in identifiers_a
     ]
@@ -636,7 +691,7 @@ def _preprocess_unpaired(
             "task_mode": TaskMode.UNPAIRED_GENERATIVE,
             "run_stage": args.run_stage,
             "storage_format": args.storage_format,
-            "patch_size_hint": args.default_patch_size,
+            "patch_size_hint": default_patch_size,
         }
         for identifier in identifiers_b
     ]
@@ -647,7 +702,9 @@ def _preprocess_unpaired(
         folder=str(output_folder),
         task_mode=TaskMode.UNPAIRED_GENERATIVE,
         run_stage=args.run_stage,
-        default_patch_size=args.default_patch_size,
+        default_patch_size=default_patch_size,
+        default_configuration=default_configuration,
+        configurations=configurations,
         folder_a=args.folder_a_name,
         folder_b=args.folder_b_name,
         config_a=config_a,
@@ -665,6 +722,9 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
     base_config = _load_config(args.config_json, args.plans_file, args.configuration_name)
     config_a = _load_config(args.config_a_json, args.plans_a_file, args.configuration_a_name)
     config_b = _load_config(args.config_b_json, args.plans_b_file, args.configuration_b_name)
+    default_patch_size = tuple(args.default_patch_size) if args.default_patch_size is not None else None
+    default_configuration = None
+    configurations = None
 
     if args.task_mode == TaskMode.UNPAIRED_GENERATIVE:
         domain_a = _scan_image_dir(args.domain_a_dir, "--domain-a-dir", args.multi_image)
@@ -676,21 +736,40 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
             config_a = config_a or base_config
             config_b = config_b or base_config
         if config_a is None:
-            config_a = _plan_config_from_cases(
+            config_a, fingerprint_a = _plan_config_from_cases(
                 domain_a,
                 args.domain_a_reader,
                 dataset_json=dataset_json_a,
                 num_processes=args.num_processes,
             )
+            configurations_a = fingerprint_a.get("planning_configurations")
+        else:
+            configurations_a = None
         if config_b is None:
-            config_b = _plan_config_from_cases(
+            config_b, fingerprint_b = _plan_config_from_cases(
                 domain_b,
                 args.domain_b_reader,
                 dataset_json=dataset_json_b,
                 num_processes=args.num_processes,
             )
+            configurations_b = fingerprint_b.get("planning_configurations")
+        else:
+            configurations_b = None
+        configurations = _merge_unpaired_configurations(configurations_a, configurations_b)
+        default_configuration = _resolve_default_configuration(configurations)
+        if default_patch_size is None and default_configuration is not None:
+            default_patch_size = tuple(configurations[default_configuration]["patch_size"])
         _log_stage(3, total_steps, "Preprocess cases", "writing preprocessed domain folders")
-        manifest_file = _preprocess_unpaired(args, config_a, config_b, dataset_json_a, dataset_json_b)
+        manifest_file = _preprocess_unpaired(
+            args,
+            config_a,
+            config_b,
+            dataset_json_a,
+            dataset_json_b,
+            default_patch_size,
+            default_configuration,
+            configurations,
+        )
     else:
         if args.task_mode in {TaskMode.SEGMENTATION, TaskMode.SELF_SUPERVISED}:
             if args.images_dir is None:
@@ -713,15 +792,26 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                 f"cases={len(images)}" + (", using dataset.json" if dataset_json is not None else ""),
             )
             if base_config is None:
-                base_config = _plan_config_from_cases(
+                base_config, fingerprint = _plan_config_from_cases(
                     images,
                     args.image_reader,
                     dataset_json=dataset_json,
                     reference_cases=labels,
                     num_processes=args.num_processes,
                 )
+                configurations = fingerprint.get("planning_configurations")
+                default_configuration = _resolve_default_configuration(configurations)
+                if default_patch_size is None and default_configuration is not None:
+                    default_patch_size = tuple(configurations[default_configuration]["patch_size"])
             _log_stage(3, total_steps, "Preprocess cases", "writing preprocessed case files")
-            manifest_file = _preprocess_segmentation_or_self_supervised(args, base_config, dataset_json)
+            manifest_file = _preprocess_segmentation_or_self_supervised(
+                args,
+                base_config,
+                dataset_json,
+                default_patch_size,
+                default_configuration,
+                configurations,
+            )
         elif args.task_mode == TaskMode.PAIRED_GENERATIVE:
             if args.source_dir is None:
                 raise ValueError("paired_generative requires --source-dir")
@@ -741,14 +831,25 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                 f"cases={len(sources)}" + (", using dataset.json" if dataset_json is not None else ""),
             )
             if base_config is None:
-                base_config = _plan_config_from_cases(
+                base_config, fingerprint = _plan_config_from_cases(
                     sources,
                     args.source_reader,
                     dataset_json=dataset_json,
                     num_processes=args.num_processes,
                 )
+                configurations = fingerprint.get("planning_configurations")
+                default_configuration = _resolve_default_configuration(configurations)
+                if default_patch_size is None and default_configuration is not None:
+                    default_patch_size = tuple(configurations[default_configuration]["patch_size"])
             _log_stage(3, total_steps, "Preprocess cases", "writing preprocessed case files")
-            manifest_file = _preprocess_paired(args, base_config, dataset_json)
+            manifest_file = _preprocess_paired(
+                args,
+                base_config,
+                dataset_json,
+                default_patch_size,
+                default_configuration,
+                configurations,
+            )
         else:
             raise ValueError(f"Unsupported task_mode '{args.task_mode}'")
 
@@ -799,17 +900,17 @@ def _build_config_argument_group(
     group.add_argument(
         json_flag,
         default=None,
-        help=f"Optional JSON file that directly defines PreprocessingConfig for {label}.",
+        help=f"{label}에 사용할 PreprocessingConfig JSON. 지정하면 자동 planning 대신 이 값을 사용",
     )
     group.add_argument(
         plans_flag,
         default=None,
-        help=f"Optional nnU-Net plans JSON file for {label}.",
+        help=f"{label}에 사용할 nnU-Net plans JSON",
     )
     group.add_argument(
         configuration_flag,
         default=None,
-        help=f"nnU-Net configuration name used with {plans_flag} for {label}.",
+        help=f"{plans_flag}와 함께 사용할 nnU-Net configuration 이름",
     )
     return group
 
@@ -824,10 +925,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     preprocess_parser = subparsers.add_parser(
         "preprocess-dataset",
-        help="Scan raw directories, preprocess cases, and write preprocessing_manifest.json",
+        help="raw 디렉토리를 스캔해 전처리하고 preprocessing_manifest.json을 생성",
         description=(
-            "Scan task-specific raw data directories, match cases automatically, save .npz/.pkl "
-            "preprocessed cases, and write preprocessing_manifest.json."
+            "task별 raw 디렉토리를 스캔하고 case를 자동 매칭한 뒤, "
+            "전처리 결과와 preprocessing_manifest.json을 생성합니다."
         ),
         epilog=PREPROCESS_DATASET_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -835,7 +936,7 @@ def build_parser() -> argparse.ArgumentParser:
     preprocess_parser.add_argument(
         "--output-folder",
         required=True,
-        help="Output folder for saved preprocessed cases and preprocessing_manifest.json.",
+        help="전처리 결과와 preprocessing_manifest.json을 저장할 출력 폴더",
     )
     preprocess_parser.add_argument(
         "--task-mode",
@@ -846,13 +947,13 @@ def build_parser() -> argparse.ArgumentParser:
             TaskMode.UNPAIRED_GENERATIVE,
             TaskMode.SELF_SUPERVISED,
         ),
-        help="Task mode used for preprocessing.",
+        help="전처리할 task mode",
     )
     preprocess_parser.add_argument(
         "--run-stage",
         default=RunStage.TRAIN,
         choices=(RunStage.TRAIN, RunStage.PREDICT, RunStage.PREDICT_AND_EVALUATE),
-        help="Run stage used for preprocessing. Default: train.",
+        help="전처리 실행 단계. 기본값: train",
     )
     preprocess_parser.add_argument(
         "--default-patch-size",
@@ -860,94 +961,94 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         metavar="DIM",
-        help="Default patch size written into the generated manifest.",
+        help="manifest에 기록할 patch size override. 생략하면 planner가 자동 결정",
     )
     preprocess_parser.add_argument(
         "--storage-format",
         choices=("blosc2", "npz"),
         default="blosc2",
-        help="Storage format for saved cases. Default: blosc2.",
+        help="저장 포맷. 기본값: blosc2",
     )
     preprocess_parser.add_argument(
         "--num-processes",
         type=int,
         default=max(1, (os.cpu_count() or 1) // 2),
-        help="Number of worker processes for planning and preprocessing. Default: half of available CPUs.",
+        help="planning/preprocessing에 사용할 worker process 수. 기본값: 사용 가능한 CPU의 절반",
     )
     preprocess_parser.add_argument(
         "--multi-image",
         action="store_true",
         help=(
-            "Treat image directories as grouped multi-image cases. "
-            "Files must follow the postfix rule case_0001_0000, case_0001_0001, ... "
-            "Single-channel files named case_0001_0000 are accepted without this flag."
+            "이미지 디렉토리를 multi-image case로 처리합니다. "
+            "파일명은 case_0001_0000, case_0001_0001 규칙을 따라야 합니다. "
+            "단일 채널 case_0001_0000 파일은 이 플래그 없이도 허용됩니다."
         ),
     )
 
-    single_or_seg_group = preprocess_parser.add_argument_group("segmentation / self_supervised options")
-    single_or_seg_group.add_argument("--images-dir", default=None, help="Input image directory.")
+    single_or_seg_group = preprocess_parser.add_argument_group("segmentation / self_supervised 옵션")
+    single_or_seg_group.add_argument("--images-dir", default=None, help="입력 이미지 디렉토리")
     single_or_seg_group.add_argument(
         "--labels-dir",
         default=None,
-        help="Segmentation label directory. Required for segmentation train and predict_and_evaluate.",
+        help="segmentation label 디렉토리. segmentation train/predict_and_evaluate에서 필요",
     )
     single_or_seg_group.add_argument(
         "--image-reader",
         default="auto",
         choices=READER_CHOICES,
-        help="Reader for --images-dir. Default: auto.",
+        help="--images-dir에 사용할 reader. 기본값: auto",
     )
     single_or_seg_group.add_argument(
         "--reference-reader",
         default=None,
         choices=READER_CHOICES,
-        help="Reader for --labels-dir. Default: use --image-reader.",
+        help="--labels-dir에 사용할 reader. 기본값: --image-reader와 동일",
     )
 
-    paired_group = preprocess_parser.add_argument_group("paired_generative options")
-    paired_group.add_argument("--source-dir", default=None, help="Source image directory.")
+    paired_group = preprocess_parser.add_argument_group("paired_generative 옵션")
+    paired_group.add_argument("--source-dir", default=None, help="source 이미지 디렉토리")
     paired_group.add_argument(
         "--target-dir",
         default=None,
-        help="Target image directory. Required for paired_generative train and predict_and_evaluate.",
+        help="target 이미지 디렉토리. paired_generative train/predict_and_evaluate에서 필요",
     )
     paired_group.add_argument(
         "--source-reader",
         default="auto",
         choices=READER_CHOICES,
-        help="Reader for --source-dir. Default: auto.",
+        help="--source-dir에 사용할 reader. 기본값: auto",
     )
     paired_group.add_argument(
         "--target-reader",
         default=None,
         choices=READER_CHOICES,
-        help="Reader for --target-dir. Default: use --source-reader.",
+        help="--target-dir에 사용할 reader. 기본값: --source-reader와 동일",
     )
 
-    preprocess_domain_group = preprocess_parser.add_argument_group("unpaired_generative options")
-    preprocess_domain_group.add_argument("--domain-a-dir", default=None, help="Domain A directory.")
-    preprocess_domain_group.add_argument("--domain-b-dir", default=None, help="Domain B directory.")
+    preprocess_domain_group = preprocess_parser.add_argument_group("unpaired_generative 옵션")
+    preprocess_domain_group.add_argument("--domain-a-dir", default=None, help="domain A 디렉토리")
+    preprocess_domain_group.add_argument("--domain-b-dir", default=None, help="domain B 디렉토리")
     preprocess_domain_group.add_argument(
         "--domain-a-reader",
         default="auto",
         choices=READER_CHOICES,
-        help="Reader for --domain-a-dir. Default: auto.",
+        help="--domain-a-dir에 사용할 reader. 기본값: auto",
     )
     preprocess_domain_group.add_argument(
         "--domain-b-reader",
         default="auto",
         choices=READER_CHOICES,
-        help="Reader for --domain-b-dir. Default: auto.",
+        help="--domain-b-dir에 사용할 reader. 기본값: auto",
     )
     preprocess_domain_group.add_argument(
         "--folder-a-name",
         default="domain_a",
-        help="Subfolder name created under --output-folder for unpaired domain A.",
+        help="unpaired 저장 시 --output-folder 아래에 생성할 domain A 하위 폴더 이름",
     )
     preprocess_domain_group.add_argument(
         "--folder-b-name",
         default="domain_b",
-        help="Subfolder name created under --output-folder for unpaired domain B.",
+        help="unpaired 저장 시 --output-folder 아래에 생성할 domain B 하위 폴더 이름",
     )
 
     _build_config_argument_group(
@@ -978,10 +1079,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     save_parser = subparsers.add_parser(
         "save-dataset",
-        help="Write preprocessing_manifest.json for an already-preprocessed dataset",
+        help="이미 저장된 전처리 case들에 대해 preprocessing_manifest.json만 생성",
         description=(
-            "Write preprocessing_manifest.json for a directory that already contains "
-            "saved preprocessed cases (.npz/.pkl)."
+            "이미 저장된 전처리 case 파일들이 있을 때, "
+            "preprocessing_manifest.json만 다시 생성합니다."
         ),
         epilog=SAVE_DATASET_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -990,8 +1091,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--folder",
         required=True,
         help=(
-            "Dataset folder. For single-folder datasets this is the folder containing the case files. "
-            "For unpaired datasets this is the root folder that will contain preprocessing_manifest.json."
+            "dataset 폴더. single-folder task에서는 case 파일이 있는 폴더이고, "
+            "unpaired task에서는 preprocessing_manifest.json이 위치할 루트 폴더입니다."
         ),
     )
     save_parser.add_argument(
@@ -1003,13 +1104,13 @@ def build_parser() -> argparse.ArgumentParser:
             TaskMode.UNPAIRED_GENERATIVE,
             TaskMode.SELF_SUPERVISED,
         ),
-        help="Task type encoded in the manifest.",
+        help="manifest에 기록할 task mode",
     )
     save_parser.add_argument(
         "--run-stage",
         default=RunStage.TRAIN,
         choices=(RunStage.TRAIN, RunStage.PREDICT, RunStage.PREDICT_AND_EVALUATE),
-        help="Run stage encoded in the manifest. Default: train.",
+        help="manifest에 기록할 run stage. 기본값: train",
     )
     save_parser.add_argument(
         "--default-patch-size",
@@ -1017,29 +1118,29 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         metavar="DIM",
-        help="Default patch size stored in the manifest, for example: --default-patch-size 96 96 96",
+        help="manifest에 기록할 patch size. 예: --default-patch-size 96 96 96",
     )
     save_parser.add_argument(
         "--storage-format",
         choices=("blosc2", "npz"),
         default="blosc2",
-        help="Storage format recorded in the manifest. Default: blosc2.",
+        help="manifest에 기록할 저장 포맷. 기본값: blosc2",
     )
-    domain_group = save_parser.add_argument_group("unpaired dataset options")
+    domain_group = save_parser.add_argument_group("unpaired dataset 옵션")
     domain_group.add_argument(
         "--folder-a",
         default=None,
-        help="Relative or absolute domain A folder. Required only for task_mode=unpaired_generative.",
+        help="상대 또는 절대 domain A 폴더. task_mode=unpaired_generative일 때만 필요",
     )
     domain_group.add_argument(
         "--folder-b",
         default=None,
-        help="Relative or absolute domain B folder. Required only for task_mode=unpaired_generative.",
+        help="상대 또는 절대 domain B 폴더. task_mode=unpaired_generative일 때만 필요",
     )
     domain_group.add_argument(
         "--disable-random-pairing",
         action="store_true",
-        help="Store random_pairing=false in the unpaired manifest.",
+        help="unpaired manifest에 random_pairing=false를 기록",
     )
     _build_config_argument_group(
         save_parser,
@@ -1069,15 +1170,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     show_parser = subparsers.add_parser(
         "show-manifest",
-        help="Print preprocessing_manifest.json as formatted JSON",
-        description="Load preprocessing_manifest.json from a preprocessed dataset folder and print it.",
+        help="preprocessing_manifest.json 내용을 보기 좋게 출력",
+        description="전처리된 dataset 폴더에서 preprocessing_manifest.json을 읽어 출력합니다.",
         epilog=SHOW_MANIFEST_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     show_parser.add_argument(
         "--folder",
         required=True,
-        help="Dataset folder containing preprocessing_manifest.json",
+        help="preprocessing_manifest.json이 들어 있는 dataset 폴더",
     )
     show_parser.set_defaults(func=_show_manifest_command)
 

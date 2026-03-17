@@ -1,36 +1,70 @@
 # medimg_preprocessor
 
-`medimg_preprocessor` is a medical image preprocessing library built to keep nnU-Net-style preprocessing behavior while being easier to reuse in other projects.
+`medimg_preprocessor`는 nnU-Net의 전처리 철학을 최대한 유지하면서, 다른 프로젝트에서도 더 쉽게 재사용할 수 있도록 분리한 의료영상 전처리 라이브러리입니다.
 
-The goal is simple:
+핵심 목표는 아래와 같습니다.
 
-- keep preprocessing close to nnU-Net
-- make CLI usage simpler
-- make the output easy to plug into PyTorch training
-- support segmentation, paired generative, unpaired generative, and self-supervised workflows with one interface
+- nnU-Net과 비슷한 전처리 흐름 유지
+- CLI 사용 단순화
+- PyTorch 학습 코드에 바로 연결 가능한 저장 포맷 제공
+- segmentation, paired generative, unpaired generative, self-supervised를 한 인터페이스로 지원
 
-## What It Covers
+## 무엇을 자동으로 해주나
 
-This package focuses on preprocessing, not full nnU-Net experiment planning for network architecture.
+`preprocess-dataset`를 실행하면, 별도 config를 주지 않아도 아래를 자동으로 수행합니다.
 
-It includes:
+- 영상 헤더에서 voxel spacing 읽기
+- nonzero crop
+- dataset fingerprint 추출
+- nnU-Net 스타일 target spacing 결정
+- transpose 순서 결정
+- channel name 기반 normalization scheme 결정
+- `2d / 3d` 기본 configuration 생성
+- configuration별 `patch_size` 계산
+- configuration별 `recommended_batch_size` 계산
+- 전처리 결과 저장
+- `preprocessing_manifest.json` 생성
 
-- medical image reader support for `nii`, `nii.gz`, `nrrd`, `mha`, `gipl`, `tif`, `tiff`, `png`, `bmp`
-- header-based spacing handling
-- nonzero cropping
-- nnU-Net-style automatic fingerprinting and preprocessing planning
-- anisotropy-aware target spacing and resampling
-- channel-name-based normalization selection when `dataset.json` is available
-- saved preprocessed cases and manifest-based dataset loading
-- `blosc2` as the default on-disk storage format for faster preprocessing output and dataset loading
+즉 사용자 입장에서는 아래 정도만 입력하면 됩니다.
 
-## Install
+```bash
+python -m medimg_preprocessor preprocess-dataset \
+  --task-mode segmentation \
+  --images-dir imagesTr \
+  --labels-dir labelsTr \
+  --output-folder preprocessed
+```
+
+## 지원 범위
+
+현재 기준으로 전처리와 데이터 로딩에 집중합니다.
+
+포함되는 것:
+
+- `nii`, `nii.gz`, `nrrd`, `mha`, `gipl`, `tif`, `tiff`, `png`, `bmp` reader
+- header 기반 spacing 처리
+- nonzero crop
+- anisotropy-aware resampling
+- normalization planning
+- `2d / 3d` patch planning
+- `blosc2` 기반 저장
+- PyTorch dataset 로드
+
+포함하지 않는 것:
+
+- nnU-Net 전체 trainer 복제
+- `3d_lowres`, `cascade`
+- nnU-Net의 전체 architecture planner
+
+즉 이 라이브러리는 `nnU-Net preprocessing/planning 중심`이지, `nnU-Net 전체 프레임워크 복제`는 아닙니다.
+
+## 설치
 
 ```bash
 pip install git+https://github.com/J1won7/medimg_preprocessor.git
 ```
 
-Main runtime dependencies are declared in the package:
+기본 의존성은 패키지에 포함되어 있습니다.
 
 - `numpy`
 - `scipy`
@@ -41,20 +75,20 @@ Main runtime dependencies are declared in the package:
 - `tifffile`
 - `scikit-image`
 
-## Typical Workflow
+## 전체 사용 흐름
 
 ```text
-raw directories
+raw 디렉토리
 -> preprocess-dataset
--> saved .npz/.pkl cases + preprocessing_manifest.json
+-> 전처리 파일(.b2nd/.pkl) + preprocessing_manifest.json
 -> load_preprocessed_dataset(...)
 -> PyTorch DataLoader
--> training
+-> 학습
 ```
 
-## Quick Start
+## 가장 많이 쓰는 명령
 
-### Segmentation
+### 1. Segmentation
 
 ```bash
 python -m medimg_preprocessor preprocess-dataset \
@@ -65,7 +99,7 @@ python -m medimg_preprocessor preprocess-dataset \
   --num-processes 8
 ```
 
-### Paired Generative
+### 2. Paired Generative
 
 ```bash
 python -m medimg_preprocessor preprocess-dataset \
@@ -75,7 +109,7 @@ python -m medimg_preprocessor preprocess-dataset \
   --output-folder preprocessed_paired
 ```
 
-### Unpaired Generative
+### 3. Unpaired Generative
 
 ```bash
 python -m medimg_preprocessor preprocess-dataset \
@@ -85,7 +119,7 @@ python -m medimg_preprocessor preprocess-dataset \
   --output-folder preprocessed_unpaired
 ```
 
-### Self-Supervised
+### 4. Self-Supervised
 
 ```bash
 python -m medimg_preprocessor preprocess-dataset \
@@ -94,100 +128,85 @@ python -m medimg_preprocessor preprocess-dataset \
   --output-folder preprocessed_ssl
 ```
 
-## Automatic Behavior
-
-If you do not provide `--config-json` or `--plans-file`, the package will automatically:
-
-- scan the dataset
-- read voxel spacing from image headers
-- crop to nonzero
-- build a fingerprint
-- estimate target spacing in an nnU-Net-style way
-- decide transpose order
-- decide normalization schemes
-- collect CT foreground intensity statistics when possible
-
-If a neighboring `dataset.json` exists, it is used for:
-
-- reader selection
-- `channel_names` / `modality`
-- nnU-Net-style normalization mapping
-
-## Directory Rules
+## 디렉토리 규칙
 
 ### Segmentation
 
-Use:
+입력:
 
 - `--images-dir`
 - `--labels-dir`
 
-Cases are matched by case identifier.
+자동 매칭 기준:
 
-Examples:
+- 같은 case identifier
+
+예시:
 
 - `imagesTr/case_0001_0000.nii.gz`
 - `labelsTr/case_0001.nii.gz`
 
-Single-channel nnU-Net image names like `case_0001_0000.nii.gz` are handled automatically.
-
 ### Paired Generative
 
-Use:
+입력:
 
 - `--source-dir`
 - `--target-dir`
 
-Cases are matched by case identifier.
+자동 매칭 기준:
 
-Examples:
+- 같은 case identifier
 
-- `source/case_0001_0000.nii.gz`
-- `target/case_0001_0000.nii.gz`
-
-or
+예시:
 
 - `source/case_0001.nii.gz`
 - `target/case_0001.nii.gz`
 
+또는
+
+- `source/case_0001_0000.nii.gz`
+- `target/case_0001_0000.nii.gz`
+
 ### Unpaired Generative
 
-Use:
+입력:
 
 - `--domain-a-dir`
 - `--domain-b-dir`
 
-There is no 1:1 pairing between the two domains at preprocessing time.
+특징:
+
+- A와 B는 preprocessing 시점에는 1:1 매칭하지 않음
+- 학습 시 dataset이 랜덤 pairing
 
 ### Self-Supervised
 
-Use:
+입력:
 
 - `--images-dir`
 
-Only image files are scanned.
+특징:
 
-## Multi-Image Cases
+- image만 전처리
+- target은 학습 루프에서 online 생성
 
-If one case is composed of multiple image files, use:
+## Multi-image 규칙
 
-```bash
---multi-image
-```
+한 케이스가 여러 파일로 구성되어 있으면 `--multi-image`를 사용합니다.
 
-Then filenames must follow this rule:
+예시:
 
 - `case_0001_0000.nii.gz`
 - `case_0001_0001.nii.gz`
 - `case_0001_0002.nii.gz`
 
-Rules:
+규칙:
 
-- postfix must be 4 digits
-- numbering must start at `0000`
-- numbering must be contiguous
+- postfix는 4자리 숫자여야 함
+- `0000`부터 시작해야 함
+- 중간 번호가 비면 안 됨
 
-This applies to image folders:
+적용 대상:
 
 - `--images-dir`
 - `--source-dir`
@@ -195,72 +214,43 @@ This applies to image folders:
 - `--domain-a-dir`
 - `--domain-b-dir`
 
-For segmentation labels, `--labels-dir` is still one file per case.
+주의:
 
-## Overriding Automatic Planning
+- segmentation label은 여전히 case당 1파일입니다
 
-Automatic planning is the default.
+## 자동 planning 결과는 어디에 저장되나
 
-If needed, you can override it with either:
+전처리 후 생성되는 `preprocessing_manifest.json` 안에 들어갑니다.
 
-### Direct config JSON
+이 파일에는 보통 아래 정보가 포함됩니다.
 
-```bash
---config-json config.json
-```
+- `task_mode`
+- `run_stage`
+- `preprocessing_config`
+- `default_configuration`
+- `configurations["2d"]`
+- `configurations["3d"]`
+- `default_patch_size`
+- `storage_format`
 
-### nnU-Net plans
+즉 `nnU-Net의 plans.json과 비슷한 역할을 현재 라이브러리에서는 manifest가 담당`한다고 보면 됩니다.
 
-```bash
---plans-file nnUNetPlans.json --configuration-name 3d_fullres
-```
+## 출력 구조
 
-For unpaired generative, you may provide:
-
-- one shared config with `--config-json`
-- separate configs with `--config-a-json` and `--config-b-json`
-
-## Storage Format
-
-Saved cases use `blosc2` by default.
-
-That means new datasets are normally written as:
-
-- `case_0001.b2nd`
-- optional `case_0001_target.b2nd`
-- optional `case_0001_evalref.b2nd`
-- `case_0001.pkl`
-
-If needed, you can still force the older NumPy archive format:
-
-```bash
---storage-format npz
-```
-
-## Parallel Processing
-
-Planning and preprocessing can run with multiple worker processes:
-
-```bash
---num-processes 8
-```
-
-If omitted, the CLI uses half of the available CPU cores by default.
-
-## Output Structure
-
-### Single-folder tasks
+### Single-folder task
 
 ```text
 preprocessed/
   case_0001.b2nd
+  case_0001_target.b2nd        # 필요한 경우만
+  case_0001_evalref.b2nd       # 필요한 경우만
   case_0001.pkl
   case_0002.b2nd
   case_0002.pkl
   preprocessing_manifest.json
 ```
 
-### Unpaired tasks
+### Unpaired task
 
 ```text
 preprocessed_unpaired/
@@ -273,7 +263,9 @@ preprocessed_unpaired/
   preprocessing_manifest.json
 ```
 
-## Loading in PyTorch
+## PyTorch에서 로드하는 방법
+
+### 기본 로드
 
 ```python
 from torch.utils.data import DataLoader
@@ -285,63 +277,166 @@ loader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=0)
 batch = next(iter(loader))
 ```
 
-Returned keys depend on the task:
+### 2D configuration으로 로드
 
-- segmentation: `image`, `target`
-- paired generative: `image`, `target`
-- unpaired generative: `image_a`, `image_b`
-- predict / predict_and_evaluate: `image`, optionally `evaluation_reference`
+자동 planning 결과에 `2d`가 있으면 아래처럼 바로 선택할 수 있습니다.
 
-## CLI
+```python
+from medimg_preprocessor import load_preprocessed_dataset
 
-Main commands:
+dataset_2d = load_preprocessed_dataset("preprocessed", configuration="2d")
+dataset_3d = load_preprocessed_dataset("preprocessed", configuration="3d")
+```
+
+동작:
+
+- `configuration="3d"`: 3D patch 사용
+- `configuration="2d"`: 3D volume이면 slice-wise 2D patch 사용
+
+### patch_size 직접 override
+
+```python
+dataset = load_preprocessed_dataset(
+    "preprocessed",
+    patch_size=(96, 96, 96),
+)
+```
+
+우선순위:
+
+1. `load_preprocessed_dataset(..., patch_size=...)`
+2. `configuration="2d" | "3d"`에 저장된 patch size
+3. manifest의 `default_patch_size`
+
+## task별 반환 키
+
+### Segmentation
+
+- `image`
+- `target`
+- `identifier`
+- `properties`
+
+### Paired Generative
+
+- `image`
+- `target`
+- `identifier`
+- `properties`
+
+### Unpaired Generative
+
+- `image_a`
+- `image_b`
+- `identifier_a`
+- `identifier_b`
+- `properties_a`
+- `properties_b`
+
+### Predict / Predict-and-Evaluate
+
+- `image`
+- optional `evaluation_reference`
+
+## config를 직접 주고 싶을 때
+
+자동 planning이 기본입니다. 필요하면 아래 둘 중 하나로 override할 수 있습니다.
+
+### 1. 직접 config JSON 사용
 
 ```bash
-python -m medimg_preprocessor preprocess-dataset --help
-python -m medimg_preprocessor show-manifest --help
+--config-json config.json
+```
+
+### 2. nnU-Net plans 사용
+
+```bash
+--plans-file nnUNetPlans.json --configuration-name 3d_fullres
+```
+
+unpaired에서는 다음도 가능합니다.
+
+- `--config-a-json`, `--config-b-json`
+- `--plans-a-file`, `--plans-b-file`
+
+## 저장 포맷
+
+기본 저장 포맷은 `blosc2`입니다.
+
+기본 출력:
+
+- `case_0001.b2nd`
+- optional `case_0001_target.b2nd`
+- optional `case_0001_evalref.b2nd`
+- `case_0001.pkl`
+
+이전 NumPy archive 포맷을 강제로 쓰고 싶으면:
+
+```bash
+--storage-format npz
+```
+
+## 병렬 처리
+
+planning과 preprocessing 모두 multi-process로 돌릴 수 있습니다.
+
+```bash
+--num-processes 8
+```
+
+지정하지 않으면 기본적으로 CPU 코어의 절반을 사용합니다.
+
+## manifest만 따로 만들고 싶을 때
+
+이미 전처리 case 파일이 있고 `preprocessing_manifest.json`만 다시 만들고 싶으면:
+
+```bash
 python -m medimg_preprocessor save-dataset --help
 ```
 
-After installation:
-
-```bash
-medimg-preprocess --help
-```
-
-## Manifest
-
-To inspect a saved dataset:
+## 저장된 설정 확인
 
 ```bash
 python -m medimg_preprocessor show-manifest --folder preprocessed
 ```
 
-If case files already exist and you only want to write the manifest:
+## CLI 도움말
 
 ```bash
+python -m medimg_preprocessor --help
+python -m medimg_preprocessor preprocess-dataset --help
 python -m medimg_preprocessor save-dataset --help
+python -m medimg_preprocessor show-manifest --help
 ```
 
-## Fail-Fast Policy
+설치 후에는 아래도 가능합니다.
 
-This package is intentionally fail-fast.
+```bash
+medimg-preprocess --help
+```
 
-It warns and raises instead of silently continuing when:
+## Fail-fast 정책
 
-- image/label identifiers do not match
-- source/target identifiers do not match
-- a multi-image case uses invalid postfix numbering
-- shapes or spacings are inconsistent
-- config values are invalid
-- a required target is missing
+이 라이브러리는 조용히 진행하지 않고, 잘못된 입력이면 바로 실패하도록 설계되어 있습니다.
 
-## Positioning
+예:
 
-This is not meant to be a full replacement for nnU-Net.
+- image/label identifier 불일치
+- source/target identifier 불일치
+- 잘못된 multi-image postfix
+- shape/spacings 불일치
+- invalid config
+- 필요한 target 누락
 
-It is meant to be:
+즉 잘못된 사용을 억지로 허용하기보다, 빨리 실패해서 원인을 바로 알 수 있게 하는 쪽입니다.
 
-- very close to nnU-Net preprocessing
-- easier to call from custom code
-- easier to use for non-segmentation workflows
-- easier to load into standard PyTorch training pipelines
+## 현재 위치
+
+이 라이브러리는 아래에 가깝습니다.
+
+- nnU-Net preprocessing/planning과 최대한 비슷한 동작
+- 더 단순한 CLI
+- custom PyTorch 코드와 연결하기 쉬운 저장/로딩 구조
+- generative / unpaired workflow까지 한 인터페이스로 확장
+
+완전한 nnU-Net 복제는 아니지만, `전처리와 planning을 다른 프로젝트에서 편하게 재사용`하는 목적에는 맞게 정리되어 있습니다.

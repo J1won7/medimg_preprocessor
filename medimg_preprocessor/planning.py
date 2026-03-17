@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import dataclass
 import multiprocessing
 from typing import Dict, Optional, Sequence
 import warnings
@@ -7,7 +9,7 @@ import warnings
 import numpy as np
 
 from .config import PreprocessingConfig, ResamplingConfig
-from .geometry import crop_to_nonzero
+from .geometry import compute_new_shape, crop_to_nonzero
 from .normalization import (
     CTNormalization,
     NoNormalization,
@@ -18,6 +20,13 @@ from .normalization import (
 
 
 ANISO_THRESHOLD = 3.0
+MIN_FEATURE_MAP_EDGE_LENGTH = 4
+UNET_MIN_BATCH_SIZE = 2
+MAX_DATASET_COVERED = 0.05
+REFERENCE_BATCH_SIZE_2D = 12
+REFERENCE_BATCH_SIZE_3D = 2
+REFERENCE_PATCH_VOLUME_2D = 2048 ** 2
+REFERENCE_PATCH_VOLUME_3D = 256 ** 3
 
 _CHANNEL_NAME_TO_NORMALIZATION = {
     "ct": CTNormalization,
@@ -26,6 +35,15 @@ _CHANNEL_NAME_TO_NORMALIZATION = {
     "rescale_to_0_1": RescaleTo01Normalization,
     "rgb_to_0_1": RGBTo01Normalization,
 }
+
+
+@dataclass(frozen=True)
+class PlanningConfiguration:
+    name: str
+    spacing: tuple[float, ...]
+    median_shape: tuple[int, ...]
+    patch_size: tuple[int, ...]
+    recommended_batch_size: int
 
 
 def _fail_validation(message: str) -> None:
@@ -59,6 +77,150 @@ def _get_channel_names(dataset_json: Optional[dict], num_channels: int) -> list[
 def _get_normalization_scheme_name(channel_name: str) -> str:
     normalizer_cls = _CHANNEL_NAME_TO_NORMALIZATION.get(channel_name.casefold(), ZScoreNormalization)
     return normalizer_cls.__name__
+
+
+def _get_shape_must_be_divisible_by(net_numpool_per_axis: Sequence[int]) -> np.ndarray:
+    return 2 ** np.array(net_numpool_per_axis)
+
+
+def _pad_shape(shape: Sequence[int], must_be_divisible_by: Sequence[int]) -> np.ndarray:
+    if not isinstance(must_be_divisible_by, (tuple, list, np.ndarray)):
+        must_be_divisible_by = [must_be_divisible_by] * len(shape)
+    elif len(must_be_divisible_by) != len(shape):
+        _fail_validation(
+            "must_be_divisible_by must either be a scalar or match shape dimensionality, "
+            f"got {len(must_be_divisible_by)} and {len(shape)}"
+        )
+    new_shape = [shape[i] + must_be_divisible_by[i] - shape[i] % must_be_divisible_by[i] for i in range(len(shape))]
+    for i in range(len(shape)):
+        if shape[i] % must_be_divisible_by[i] == 0:
+            new_shape[i] -= must_be_divisible_by[i]
+    return np.array(new_shape).astype(int)
+
+
+def _get_pool_and_conv_props(
+    spacing: Sequence[float],
+    patch_size: Sequence[int],
+    min_feature_map_size: int,
+    max_numpool: int,
+) -> tuple[list[int], tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...], tuple[int, ...], np.ndarray]:
+    dim = len(spacing)
+    current_spacing = deepcopy(list(spacing))
+    current_size = deepcopy(list(patch_size))
+
+    pool_op_kernel_sizes = [[1] * dim]
+    conv_kernel_sizes = []
+    num_pool_per_axis = [0] * dim
+    kernel_size = [1] * dim
+
+    while True:
+        valid_axes_for_pool = [i for i in range(dim) if current_size[i] >= 2 * min_feature_map_size]
+        if len(valid_axes_for_pool) < 1:
+            break
+
+        spacings_of_axes = [current_spacing[i] for i in valid_axes_for_pool]
+        min_spacing_of_valid = min(spacings_of_axes)
+        valid_axes_for_pool = [i for i in valid_axes_for_pool if current_spacing[i] / min_spacing_of_valid < 2]
+        valid_axes_for_pool = [i for i in valid_axes_for_pool if num_pool_per_axis[i] < max_numpool]
+
+        if len(valid_axes_for_pool) == 1 and current_size[valid_axes_for_pool[0]] < 3 * min_feature_map_size:
+            break
+        if len(valid_axes_for_pool) < 1:
+            break
+
+        for d in range(dim):
+            if kernel_size[d] == 3:
+                continue
+            if current_spacing[d] / min(current_spacing) < 2:
+                kernel_size[d] = 3
+
+        other_axes = [i for i in range(dim) if i not in valid_axes_for_pool]
+        pool_kernel_sizes = [0] * dim
+        for axis in valid_axes_for_pool:
+            pool_kernel_sizes[axis] = 2
+            num_pool_per_axis[axis] += 1
+            current_spacing[axis] *= 2
+            current_size[axis] = np.ceil(current_size[axis] / 2)
+        for axis in other_axes:
+            pool_kernel_sizes[axis] = 1
+
+        pool_op_kernel_sizes.append(pool_kernel_sizes)
+        conv_kernel_sizes.append(deepcopy(kernel_size))
+
+    must_be_divisible_by = _get_shape_must_be_divisible_by(num_pool_per_axis)
+    patch_size = _pad_shape(patch_size, must_be_divisible_by)
+    conv_kernel_sizes.append([3] * dim)
+
+    def _to_tuple(lst):
+        return tuple(_to_tuple(i) if isinstance(i, list) else i for i in lst)
+
+    return (
+        num_pool_per_axis,
+        _to_tuple(pool_op_kernel_sizes),
+        _to_tuple(conv_kernel_sizes),
+        tuple(int(i) for i in patch_size),
+        must_be_divisible_by,
+    )
+
+
+def _estimate_patch_and_batch(
+    spacing: Sequence[float],
+    median_shape: Sequence[float],
+    approximate_n_voxels_dataset: float,
+) -> tuple[tuple[int, ...], int]:
+    spacing = np.asarray(spacing, dtype=np.float64)
+    median_shape = np.asarray(median_shape, dtype=np.float64)
+    if len(spacing) not in (2, 3):
+        _fail_validation(f"Only 2D and 3D planning are supported, got spacing with {len(spacing)} dims")
+
+    tmp = 1 / spacing
+    if len(spacing) == 3:
+        initial_patch_size = [round(i) for i in tmp * (REFERENCE_PATCH_VOLUME_3D / np.prod(tmp)) ** (1 / 3)]
+        reference_patch_volume = REFERENCE_PATCH_VOLUME_3D
+        reference_batch_size = REFERENCE_BATCH_SIZE_3D
+    else:
+        initial_patch_size = [round(i) for i in tmp * (REFERENCE_PATCH_VOLUME_2D / np.prod(tmp)) ** (1 / 2)]
+        reference_patch_volume = REFERENCE_PATCH_VOLUME_2D
+        reference_batch_size = REFERENCE_BATCH_SIZE_2D
+
+    initial_patch_size = np.array([min(i, j) for i, j in zip(initial_patch_size, median_shape[: len(spacing)])])
+    _, _, _, patch_size, shape_must_be_divisible_by = _get_pool_and_conv_props(
+        spacing,
+        initial_patch_size,
+        MIN_FEATURE_MAP_EDGE_LENGTH,
+        999999,
+    )
+
+    patch_size = np.asarray(patch_size, dtype=int)
+    target_patch_volume = reference_patch_volume if len(spacing) == 2 else max(REFERENCE_PATCH_VOLUME_3D // 4, 128 ** 3)
+    while np.prod(patch_size, dtype=np.int64) > target_patch_volume and np.any(patch_size > shape_must_be_divisible_by):
+        axis_to_be_reduced = int(np.argsort([i / j for i, j in zip(patch_size, median_shape[: len(spacing)])])[-1])
+        tmp_patch = list(patch_size)
+        tmp_patch[axis_to_be_reduced] -= int(shape_must_be_divisible_by[axis_to_be_reduced])
+        if tmp_patch[axis_to_be_reduced] < 2 * MIN_FEATURE_MAP_EDGE_LENGTH:
+            break
+        _, _, _, _, shape_must_be_divisible_by = _get_pool_and_conv_props(
+            spacing,
+            tmp_patch,
+            MIN_FEATURE_MAP_EDGE_LENGTH,
+            999999,
+        )
+        tmp_patch[axis_to_be_reduced] -= int(shape_must_be_divisible_by[axis_to_be_reduced])
+        if tmp_patch[axis_to_be_reduced] < 2 * MIN_FEATURE_MAP_EDGE_LENGTH:
+            break
+        _, _, _, patch_size, shape_must_be_divisible_by = _get_pool_and_conv_props(
+            spacing,
+            tmp_patch,
+            MIN_FEATURE_MAP_EDGE_LENGTH,
+            999999,
+        )
+        patch_size = np.asarray(patch_size, dtype=int)
+
+    patch_voxels = max(1, int(np.prod(patch_size, dtype=np.int64)))
+    batch_size = round((reference_patch_volume / patch_voxels) * reference_batch_size)
+    bs_corresponding_to_5_percent = round(approximate_n_voxels_dataset * MAX_DATASET_COVERED / float(patch_voxels))
+    batch_size = max(min(batch_size, bs_corresponding_to_5_percent), UNET_MIN_BATCH_SIZE)
+    return tuple(int(i) for i in patch_size), int(batch_size)
 
 
 def collect_foreground_intensities(
@@ -329,6 +491,55 @@ def determine_normalization_scheme_and_mask(
     return normalization_schemes, use_nonzero_mask_for_norm
 
 
+def _build_configurations(
+    fingerprint: dict,
+    transpose_forward: Sequence[int],
+    *,
+    target_spacing: Sequence[float],
+) -> dict[str, PlanningConfiguration]:
+    new_shapes = [
+        compute_new_shape(shape_after_crop, spacing, target_spacing)
+        for spacing, shape_after_crop in zip(fingerprint["spacings"], fingerprint["shapes_after_crop"])
+    ]
+    new_median_shape = np.median(np.vstack(new_shapes), 0)
+    new_median_shape_transposed = new_median_shape[np.asarray(transpose_forward)]
+    fullres_spacing_transposed = np.asarray(target_spacing)[np.asarray(transpose_forward)]
+    approximate_n_voxels_dataset = float(
+        np.prod(new_median_shape_transposed, dtype=np.float64) * len(fingerprint["shapes_after_crop"])
+    )
+
+    configurations: dict[str, PlanningConfiguration] = {}
+    patch_size_3d, batch_size_3d = _estimate_patch_and_batch(
+        fullres_spacing_transposed,
+        new_median_shape_transposed,
+        approximate_n_voxels_dataset,
+    )
+    configurations["3d"] = PlanningConfiguration(
+        name="3d",
+        spacing=tuple(float(i) for i in fullres_spacing_transposed),
+        median_shape=tuple(int(round(i)) for i in new_median_shape_transposed),
+        patch_size=patch_size_3d,
+        recommended_batch_size=batch_size_3d,
+    )
+
+    if len(fullres_spacing_transposed) >= 2:
+        spacing_2d = tuple(float(i) for i in fullres_spacing_transposed[-2:])
+        median_shape_2d = tuple(float(i) for i in new_median_shape_transposed[-2:])
+        patch_size_2d, batch_size_2d = _estimate_patch_and_batch(
+            spacing_2d,
+            median_shape_2d,
+            approximate_n_voxels_dataset,
+        )
+        configurations["2d"] = PlanningConfiguration(
+            name="2d",
+            spacing=spacing_2d,
+            median_shape=tuple(int(round(i)) for i in median_shape_2d),
+            patch_size=patch_size_2d,
+            recommended_batch_size=batch_size_2d,
+        )
+    return configurations
+
+
 def plan_preprocessing_from_cases(
     cases: dict[str, list[str]],
     reader,
@@ -377,4 +588,17 @@ def plan_preprocessing_from_cases(
             separate_z_anisotropy_threshold=ANISO_THRESHOLD,
         ),
     )
+    fingerprint["planning_configurations"] = {
+        name: {
+            "spacing": list(configuration.spacing),
+            "median_shape": list(configuration.median_shape),
+            "patch_size": list(configuration.patch_size),
+            "recommended_batch_size": int(configuration.recommended_batch_size),
+        }
+        for name, configuration in _build_configurations(
+            fingerprint,
+            transpose_forward,
+            target_spacing=target_spacing,
+        ).items()
+    }
     return config, fingerprint

@@ -53,6 +53,28 @@ def _serialize_config(config: Optional[PreprocessingConfig]) -> Optional[dict]:
     return asdict(config)
 
 
+def _normalize_configuration_plans(configurations: Optional[Dict[str, dict]]) -> Optional[dict]:
+    if configurations is None:
+        return None
+    if not isinstance(configurations, dict):
+        _fail_validation("configurations must be a dict when provided")
+    normalized = {}
+    for name, payload in configurations.items():
+        if not isinstance(payload, dict):
+            _fail_validation(f"configuration '{name}' must be a dict")
+        patch_size = payload.get("patch_size")
+        spacing = payload.get("spacing")
+        median_shape = payload.get("median_shape")
+        recommended_batch_size = payload.get("recommended_batch_size")
+        normalized[str(name)] = {
+            "patch_size": None if patch_size is None else [int(i) for i in patch_size],
+            "spacing": None if spacing is None else [float(i) for i in spacing],
+            "median_shape": None if median_shape is None else [int(i) for i in median_shape],
+            "recommended_batch_size": None if recommended_batch_size is None else int(recommended_batch_size),
+        }
+    return normalized
+
+
 def _validate_task_mode(task_mode: str) -> None:
     valid = {
         TaskMode.SEGMENTATION,
@@ -222,6 +244,8 @@ def save_preprocessed_dataset_manifest(
     *,
     config: Optional[PreprocessingConfig] = None,
     default_patch_size: Optional[Sequence[int]] = None,
+    default_configuration: Optional[str] = None,
+    configurations: Optional[Dict[str, dict]] = None,
     identifiers: Optional[Sequence[str]] = None,
     storage_format: str = DEFAULT_STORAGE_FORMAT,
 ) -> str:
@@ -238,6 +262,8 @@ def save_preprocessed_dataset_manifest(
         "dataset_kind": "single_folder",
         "storage_format": _validate_storage_format(storage_format),
         "default_patch_size": None if default_patch_size is None else [int(i) for i in default_patch_size],
+        "default_configuration": default_configuration,
+        "configurations": _normalize_configuration_plans(configurations),
         "identifiers": list(identifiers) if identifiers is not None else _list_identifiers(folder),
         "preprocessing_config": _serialize_config(config),
     }
@@ -253,6 +279,8 @@ def save_preprocessed_dataset(
     *,
     config: Optional[PreprocessingConfig] = None,
     default_patch_size: Optional[Sequence[int]] = None,
+    default_configuration: Optional[str] = None,
+    configurations: Optional[Dict[str, dict]] = None,
     identifiers: Optional[Sequence[str]] = None,
     folder_a: Optional[str] = None,
     folder_b: Optional[str] = None,
@@ -276,6 +304,8 @@ def save_preprocessed_dataset(
             config_a=config_a,
             config_b=config_b,
             default_patch_size=default_patch_size,
+            default_configuration=default_configuration,
+            configurations=configurations,
             identifiers_a=identifiers_a,
             identifiers_b=identifiers_b,
             random_pairing=random_pairing,
@@ -293,6 +323,8 @@ def save_preprocessed_dataset(
         run_stage=run_stage,
         config=config,
         default_patch_size=default_patch_size,
+        default_configuration=default_configuration,
+        configurations=configurations,
         identifiers=identifiers,
         storage_format=storage_format,
     )
@@ -307,6 +339,8 @@ def save_unpaired_preprocessed_dataset_manifest(
     config_a: Optional[PreprocessingConfig] = None,
     config_b: Optional[PreprocessingConfig] = None,
     default_patch_size: Optional[Sequence[int]] = None,
+    default_configuration: Optional[str] = None,
+    configurations: Optional[Dict[str, dict]] = None,
     identifiers_a: Optional[Sequence[str]] = None,
     identifiers_b: Optional[Sequence[str]] = None,
     random_pairing: bool = True,
@@ -330,6 +364,8 @@ def save_unpaired_preprocessed_dataset_manifest(
         "dataset_kind": "unpaired_domains",
         "storage_format": _validate_storage_format(storage_format),
         "default_patch_size": None if default_patch_size is None else [int(i) for i in default_patch_size],
+        "default_configuration": default_configuration,
+        "configurations": _normalize_configuration_plans(configurations),
         "random_pairing": bool(random_pairing),
         "domains": {
             "a": {
@@ -377,6 +413,21 @@ def load_preprocessed_dataset_manifest(folder: str) -> dict:
         _fail_validation(f"{task_mode} manifest must use dataset_kind 'single_folder'")
     if manifest.get("default_patch_size") is not None and not isinstance(manifest["default_patch_size"], list):
         _fail_validation("Manifest 'default_patch_size' must be a list when provided")
+    if manifest.get("default_configuration") is not None and not isinstance(manifest["default_configuration"], str):
+        _fail_validation("Manifest 'default_configuration' must be a string when provided")
+    if manifest.get("configurations") is not None:
+        if not isinstance(manifest["configurations"], dict):
+            _fail_validation("Manifest 'configurations' must be a dict when provided")
+        for name, payload in manifest["configurations"].items():
+            if not isinstance(payload, dict):
+                _fail_validation(f"Manifest configuration '{name}' must be a dict")
+            for key in ("patch_size", "spacing", "median_shape"):
+                if payload.get(key) is not None and not isinstance(payload[key], list):
+                    _fail_validation(f"Manifest configuration '{name}' field '{key}' must be a list when provided")
+            if payload.get("recommended_batch_size") is not None and not isinstance(payload["recommended_batch_size"], int):
+                _fail_validation(
+                    f"Manifest configuration '{name}' field 'recommended_batch_size' must be an int when provided"
+                )
     if dataset_kind == "single_folder":
         identifiers = manifest.get("identifiers")
         if identifiers is not None and not isinstance(identifiers, list):
@@ -481,18 +532,48 @@ def _validate_patch_dims(array: np.ndarray, patch_size: Optional[Sequence[int]],
     if patch_size is None:
         return
     spatial_dims = array.ndim - 1
-    if len(patch_size) != spatial_dims:
-        _fail_validation(
-            f"{context} expects patch_size with {spatial_dims} spatial dims, got {len(patch_size)} "
-            f"for array shape {array.shape}"
-        )
+    if len(patch_size) == spatial_dims:
+        return
+    if spatial_dims == 3 and len(patch_size) == 2:
+        return
+    _fail_validation(
+        f"{context} expects patch_size with {spatial_dims} spatial dims, got {len(patch_size)} "
+        f"for array shape {array.shape}"
+    )
+
+
+def _resolve_patch_size(array: np.ndarray, patch_size: Optional[Sequence[int]], context: str) -> Optional[tuple[int, ...]]:
+    if patch_size is None:
+        return None
+    spatial_dims = array.ndim - 1
+    _validate_patch_dims(array, patch_size, context)
+    if len(patch_size) == spatial_dims:
+        return tuple(int(i) for i in patch_size)
+    if spatial_dims == 3 and len(patch_size) == 2:
+        return (1, int(patch_size[0]), int(patch_size[1]))
+    _fail_validation(
+        f"{context} expects patch_size with {spatial_dims} spatial dims, got {len(patch_size)} "
+        f"for array shape {array.shape}"
+    )
+
+
+def _crop_spatial(array: np.ndarray, target: Sequence[int], starts: Sequence[int]) -> np.ndarray:
+    slicer = (slice(None),) + tuple(slice(s, s + p) for s, p in zip(starts, target))
+    return array[slicer]
+
+
+def _squeeze_2d_patch_if_needed(array: np.ndarray, patch_size: Optional[Sequence[int]]) -> np.ndarray:
+    if patch_size is None:
+        return array
+    if array.ndim == 4 and len(patch_size) == 2 and array.shape[1] == 1:
+        return array[:, 0]
+    return array
 
 
 def _crop_or_pad(array: np.ndarray, patch_size: Optional[Sequence[int]], rng: np.random.RandomState) -> np.ndarray:
     if patch_size is None:
         return array
-    _validate_patch_dims(array, patch_size, "crop/pad")
-    target = tuple(int(i) for i in patch_size)
+    target = _resolve_patch_size(array, patch_size, "crop/pad")
     pad_width = [(0, 0)]
     for current, wanted in zip(array.shape[1:], target):
         missing = max(wanted - current, 0)
@@ -504,13 +585,11 @@ def _crop_or_pad(array: np.ndarray, patch_size: Optional[Sequence[int]], rng: np
     starts = []
     for current, wanted in zip(array.shape[1:], target):
         starts.append(0 if current == wanted else int(rng.randint(0, current - wanted + 1)))
-    slicer = (slice(None),) + tuple(slice(s, s + p) for s, p in zip(starts, target))
-    return array[slicer]
+    return _squeeze_2d_patch_if_needed(_crop_spatial(array, target, starts), patch_size)
 
 
 def _pad_to_patch_size(array: np.ndarray, patch_size: Sequence[int]) -> np.ndarray:
-    _validate_patch_dims(array, patch_size, "crop/pad")
-    target = tuple(int(i) for i in patch_size)
+    target = _resolve_patch_size(array, patch_size, "crop/pad")
     pad_width = [(0, 0)]
     for current, wanted in zip(array.shape[1:], target):
         missing = max(wanted - current, 0)
@@ -527,26 +606,27 @@ def _compute_crop_starts(
     patch_size: Sequence[int],
     rng: np.random.RandomState,
 ) -> Tuple[int, ...]:
-    if len(spatial_shape) != len(patch_size):
+    effective_patch = tuple(int(i) for i in patch_size)
+    if len(spatial_shape) == 3 and len(effective_patch) == 2:
+        effective_patch = (1, *effective_patch)
+    if len(spatial_shape) != len(effective_patch):
         _fail_validation(
             f"crop/pad expects patch_size with {len(spatial_shape)} spatial dims, got {len(patch_size)} "
             f"for spatial shape {tuple(spatial_shape)}"
         )
     starts = []
-    for current, wanted in zip(spatial_shape, patch_size):
+    for current, wanted in zip(spatial_shape, effective_patch):
         current = max(current, wanted)
         starts.append(0 if current == wanted else int(rng.randint(0, current - wanted + 1)))
     return tuple(starts)
 
 
 def _crop_with_starts(array: np.ndarray, patch_size: Sequence[int], starts: Sequence[int]) -> np.ndarray:
-    _validate_patch_dims(array, patch_size, "crop/pad")
-    target = tuple(int(i) for i in patch_size)
+    target = _resolve_patch_size(array, patch_size, "crop/pad")
     if len(starts) != len(target):
         _fail_validation(f"crop/pad received {len(starts)} crop starts for patch_size with {len(target)} dims")
     array = _pad_to_patch_size(array, target)
-    slicer = (slice(None),) + tuple(slice(s, s + p) for s, p in zip(starts, target))
-    return array[slicer]
+    return _squeeze_2d_patch_if_needed(_crop_spatial(array, target, starts), patch_size)
 
 
 class TaskPreprocessedDataset(Dataset):
@@ -714,6 +794,7 @@ def load_preprocessed_dataset(
     folder: str,
     *,
     patch_size: Optional[Sequence[int]] = None,
+    configuration: Optional[str] = None,
     transform: Optional[Callable[[Dict], Dict]] = None,
     seed: int = 1234,
     random_pairing: Optional[bool] = None,
@@ -721,7 +802,15 @@ def load_preprocessed_dataset(
 ) -> Dataset:
     manifest = load_preprocessed_dataset_manifest(folder)
     manifest_patch_size = manifest.get("default_patch_size")
-    effective_patch_size = patch_size if patch_size is not None else manifest_patch_size
+    manifest_configurations = manifest.get("configurations") or {}
+    effective_configuration = configuration if configuration is not None else manifest.get("default_configuration")
+    if effective_configuration is not None and effective_configuration not in manifest_configurations:
+        _fail_validation(f"Requested configuration '{effective_configuration}' is not present in the manifest")
+    effective_patch_size = patch_size
+    if effective_patch_size is None and effective_configuration is not None:
+        effective_patch_size = manifest_configurations.get(effective_configuration, {}).get("patch_size")
+    if effective_patch_size is None:
+        effective_patch_size = manifest_patch_size
     task_mode = manifest["task_mode"]
     run_stage = manifest["run_stage"]
 
