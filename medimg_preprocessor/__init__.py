@@ -14,6 +14,14 @@ from .preprocessing import (
     aggregate_intensity_properties_from_image_files,
     compute_intensity_properties_from_image,
 )
+from .planning import (
+    ANISO_THRESHOLD,
+    determine_fullres_target_spacing,
+    determine_normalization_scheme_and_mask,
+    determine_transpose,
+    extract_fingerprint_from_cases,
+    plan_preprocessing_from_cases,
+)
 
 try:
     from .imageio import (
@@ -68,6 +76,12 @@ __all__ = [
     "aggregate_intensity_properties_from_arrays",
     "aggregate_intensity_properties_from_image_files",
     "compute_intensity_properties_from_image",
+    "ANISO_THRESHOLD",
+    "determine_fullres_target_spacing",
+    "determine_normalization_scheme_and_mask",
+    "determine_transpose",
+    "extract_fingerprint_from_cases",
+    "plan_preprocessing_from_cases",
 ]
 
 _imageio_exports = [

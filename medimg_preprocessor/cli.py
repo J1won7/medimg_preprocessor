@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -11,6 +12,7 @@ from .dataset import (
     save_preprocessed_case,
     save_preprocessed_dataset,
 )
+from .planning import plan_preprocessing_from_cases
 from .preprocessing import RunStage, TaskMode
 
 
@@ -19,8 +21,10 @@ DESCRIPTION = """Manage medimg_preprocessor datasets and manifests.
 This CLI supports two workflows:
 
 1. preprocess-dataset
-   Read raw files from a JSON spec, save preprocessed .npz/.pkl cases,
-   and write preprocessing_manifest.json.
+   Scan raw data directories, preprocess matching cases, save .npz/.pkl cases,
+   and write preprocessing_manifest.json. If no config or plans are provided,
+   preprocessing settings are determined automatically from the dataset in an
+   nnU-Net-style fingerprint/planning step.
 
 2. save-dataset
    Write preprocessing_manifest.json for a dataset whose preprocessed case
@@ -28,36 +32,18 @@ This CLI supports two workflows:
 """
 
 
-PREPROCESS_DATASET_EPILOG = """JSON spec examples:
-  Single-folder segmentation:
-    {
-      "cases": [
-        {
-          "identifier": "case_0001",
-          "image_files": ["raw/imagesTr/case_0001_0000.nii.gz"],
-          "reference_files": "raw/labelsTr/case_0001.nii.gz"
-        }
-      ]
-    }
+PREPROCESS_DATASET_EPILOG = """Examples:
+  Segmentation:
+    python -m medimg_preprocessor preprocess-dataset --task-mode segmentation --images-dir raw/imagesTr --labels-dir raw/labelsTr --output-folder preprocessed_seg
+
+  Segmentation with multi-image inputs:
+    python -m medimg_preprocessor preprocess-dataset --task-mode segmentation --images-dir raw/imagesTr --labels-dir raw/labelsTr --output-folder preprocessed_seg --multi-image
+
+  Paired generative:
+    python -m medimg_preprocessor preprocess-dataset --task-mode paired_generative --source-dir raw/source --target-dir raw/target --output-folder preprocessed_paired
 
   Unpaired generative:
-    {
-      "domains": {
-        "a": [
-          {"identifier": "a_0001", "image_files": ["raw/domain_a/a_0001.nii.gz"]}
-        ],
-        "b": [
-          {"identifier": "b_0001", "image_files": ["raw/domain_b/b_0001.nii.gz"]}
-        ]
-      }
-    }
-
-Examples:
-  Segmentation preprocessing:
-    python -m medimg_preprocessor preprocess-dataset --spec segmentation_spec.json --output-folder preprocessed_seg --task-mode segmentation --run-stage train --config-json config.json
-
-  Unpaired generative preprocessing:
-    python -m medimg_preprocessor preprocess-dataset --spec unpaired_spec.json --output-folder preprocessed_unpaired --task-mode unpaired_generative --config-a-json config_a.json --config-b-json config_b.json
+    python -m medimg_preprocessor preprocess-dataset --task-mode unpaired_generative --domain-a-dir raw/domain_a --domain-b-dir raw/domain_b --output-folder preprocessed_unpaired
 """
 
 
@@ -88,6 +74,20 @@ READER_CHOICES = (
     "natural_2d",
 )
 
+SUPPORTED_SCAN_ENDINGS = (
+    ".nii.gz",
+    ".nii",
+    ".nrrd",
+    ".mha",
+    ".gipl",
+    ".tiff",
+    ".tif",
+    ".png",
+    ".bmp",
+)
+
+MULTI_IMAGE_PATTERN = re.compile(r"^(?P<identifier>.+_\d{4})_(?P<channel>\d{4})$")
+
 
 def _load_config_from_json(path: Optional[str]) -> Optional[PreprocessingConfig]:
     if path is None:
@@ -110,7 +110,13 @@ def _load_config_from_json(path: Optional[str]) -> Optional[PreprocessingConfig]
         ),
         resampling=ResamplingConfig(
             image_order=int(resampling_payload.get("image_order", 3)),
+            image_order_z=int(resampling_payload.get("image_order_z", 0)),
             label_order=int(resampling_payload.get("label_order", 0)),
+            label_order_z=int(resampling_payload.get("label_order_z", 0)),
+            force_separate_z=resampling_payload.get("force_separate_z", None),
+            separate_z_anisotropy_threshold=float(
+                resampling_payload.get("separate_z_anisotropy_threshold", 3.0)
+            ),
         ),
     )
 
@@ -133,49 +139,23 @@ def _load_config(
     return None
 
 
-def _load_spec(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-    if not isinstance(payload, dict):
-        raise ValueError(f"Spec JSON must contain an object, got {type(payload).__name__}")
-    return payload
-
-
-def _normalize_image_files(value, *, field_name: str) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if not isinstance(value, list) or len(value) == 0 or any(not isinstance(i, str) for i in value):
-        raise ValueError(f"{field_name} must be a non-empty string list or a string")
-    return value
-
-
-def _normalize_reference_files(value, *, segmentation_reference: bool):
-    if value is None:
-        return None
-    if segmentation_reference and isinstance(value, str):
-        return value
-    return _normalize_image_files(value, field_name="reference_files")
-
-
-def _validate_case_entry(case_payload: dict, *, context: str) -> tuple[str, list[str], object]:
-    if not isinstance(case_payload, dict):
-        raise ValueError(f"{context} must be an object")
-    identifier = case_payload.get("identifier")
-    if not isinstance(identifier, str) or len(identifier.strip()) == 0:
-        raise ValueError(f"{context}.identifier must be a non-empty string")
-    image_files = _normalize_image_files(case_payload.get("image_files"), field_name=f"{context}.image_files")
-    return identifier, image_files, case_payload.get("reference_files")
+def _strip_known_suffix(filename: str) -> str:
+    lower = filename.lower()
+    for ending in SUPPORTED_SCAN_ENDINGS:
+        if lower.endswith(ending):
+            return filename[: -len(ending)]
+    return Path(filename).stem
 
 
 def _detect_file_ending(filename: str) -> str:
     lower = filename.lower()
-    for ending in (".nii.gz", ".nii", ".nrrd", ".mha", ".gipl", ".tiff", ".tif", ".png", ".bmp"):
+    for ending in SUPPORTED_SCAN_ENDINGS:
         if lower.endswith(ending):
             return ending
     return Path(filename).suffix.lower()
 
 
-def _build_reader(reader_name: str, example_file: str):
+def _build_reader(reader_name: str, example_file: str, dataset_json_content: Optional[dict] = None):
     from .imageio import (
         NaturalImage2DIO,
         NibabelIO,
@@ -183,6 +163,7 @@ def _build_reader(reader_name: str, example_file: str):
         SimpleITKIO,
         SimpleITKIOWithReorient,
         Tiff3DIO,
+        determine_reader_writer_from_dataset_json,
         determine_reader_writer_from_file_ending,
     )
 
@@ -195,6 +176,12 @@ def _build_reader(reader_name: str, example_file: str):
         "natural_2d": NaturalImage2DIO,
     }
     if reader_name == "auto":
+        if dataset_json_content is not None:
+            return determine_reader_writer_from_dataset_json(
+                dataset_json_content,
+                example_file=example_file,
+                verbose=False,
+            )()
         ending = _detect_file_ending(example_file)
         return determine_reader_writer_from_file_ending(ending, example_file=example_file, verbose=False)()
     if reader_name not in registry:
@@ -209,191 +196,409 @@ def _prepare_output_prefix(output_folder: Path, identifier: str) -> Path:
     return output_prefix
 
 
-def _preprocess_single_folder_dataset(
+def _load_json_file(path: Optional[Path]) -> Optional[dict]:
+    if path is None or not path.is_file():
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object in {path}, got {type(payload).__name__}")
+    return payload
+
+
+def _discover_dataset_json(*directories: Optional[str]) -> Optional[dict]:
+    candidates: list[Path] = []
+    for directory in directories:
+        if directory is None:
+            continue
+        path = Path(directory)
+        if path.is_dir():
+            candidates.append(path / "dataset.json")
+            candidates.append(path.parent / "dataset.json")
+    for candidate in candidates:
+        payload = _load_json_file(candidate)
+        if payload is not None:
+            return payload
+    return None
+
+
+def _plan_config_from_cases(
+    cases: dict[str, list[str]],
+    reader_name: str,
     *,
-    spec: dict,
+    dataset_json: Optional[dict] = None,
+    reference_cases: Optional[dict[str, str]] = None,
+) -> PreprocessingConfig:
+    first_identifier = sorted(cases.keys())[0]
+    reader = _build_reader(reader_name, cases[first_identifier][0], dataset_json)
+    config, _ = plan_preprocessing_from_cases(
+        cases,
+        reader,
+        dataset_json=dataset_json,
+        reference_cases=reference_cases,
+    )
+    return config
+
+
+def _list_supported_files(folder: str, label: str) -> list[Path]:
+    directory = Path(folder)
+    if not directory.is_dir():
+        raise ValueError(f"{label} does not exist or is not a directory: {directory}")
+    files = [
+        path
+        for path in sorted(directory.iterdir())
+        if path.is_file() and any(path.name.lower().endswith(ending) for ending in SUPPORTED_SCAN_ENDINGS)
+    ]
+    if len(files) == 0:
+        raise ValueError(f"{label} does not contain any supported image files: {directory}")
+    return files
+
+
+def _scan_single_image_dir(folder: str, label: str) -> dict[str, list[str]]:
+    cases: dict[str, list[str]] = {}
+    for path in _list_supported_files(folder, label):
+        stem = _strip_known_suffix(path.name)
+        match = MULTI_IMAGE_PATTERN.match(stem)
+        if match is not None:
+            identifier = match.group("identifier")
+            channel = int(match.group("channel"))
+            if channel != 0:
+                raise ValueError(
+                    f"{label} file '{path.name}' looks like a multi-image channel file. "
+                    "Use --multi-image for cases with postfixes beyond _0000."
+                )
+        else:
+            identifier = stem
+        if identifier in cases:
+            raise ValueError(
+                f"{label} contains multiple files for identifier '{identifier}'. "
+                "Use --multi-image if these files are channel postfixes like case_0001_0000."
+            )
+        cases[identifier] = [str(path)]
+    return cases
+
+
+def _scan_multi_image_dir(folder: str, label: str) -> dict[str, list[str]]:
+    grouped: dict[str, list[tuple[int, str]]] = {}
+    for path in _list_supported_files(folder, label):
+        stem = _strip_known_suffix(path.name)
+        match = MULTI_IMAGE_PATTERN.match(stem)
+        if match is None:
+            raise ValueError(
+                f"{label} file '{path.name}' does not match the required multi-image postfix rule "
+                "(for example case_0001_0000, case_0001_0001)."
+            )
+        identifier = match.group("identifier")
+        channel = int(match.group("channel"))
+        grouped.setdefault(identifier, []).append((channel, str(path)))
+
+    cases: dict[str, list[str]] = {}
+    for identifier, items in grouped.items():
+        items = sorted(items, key=lambda x: x[0])
+        expected = list(range(len(items)))
+        observed = [channel for channel, _ in items]
+        if observed != expected:
+            raise ValueError(
+                f"Multi-image case '{identifier}' must use contiguous postfixes starting at 0000, got {observed}"
+            )
+        cases[identifier] = [path for _, path in items]
+    if len(cases) == 0:
+        raise ValueError(f"{label} does not contain any valid multi-image cases")
+    return cases
+
+
+def _scan_image_dir(folder: str, label: str, multi_image: bool) -> dict[str, list[str]]:
+    return _scan_multi_image_dir(folder, label) if multi_image else _scan_single_image_dir(folder, label)
+
+
+def _assert_matching_identifiers(
+    left: dict[str, list[str]],
+    right: dict[str, list[str]],
+    left_label: str,
+    right_label: str,
+) -> list[str]:
+    left_ids = set(left.keys())
+    right_ids = set(right.keys())
+    missing_in_right = sorted(left_ids.difference(right_ids))
+    missing_in_left = sorted(right_ids.difference(left_ids))
+    if missing_in_right or missing_in_left:
+        pieces = []
+        if missing_in_right:
+            pieces.append(f"missing in {right_label}: {missing_in_right}")
+        if missing_in_left:
+            pieces.append(f"missing in {left_label}: {missing_in_left}")
+        raise ValueError(
+            f"{left_label} and {right_label} must contain the same case identifiers; " + "; ".join(pieces)
+        )
+    return sorted(left_ids)
+
+
+def _preprocess_case(
+    *,
+    identifier: str,
+    image_files: list[str],
+    image_reader_name: str,
+    image_dataset_json: Optional[dict],
+    config: PreprocessingConfig,
     output_folder: Path,
     task_mode: str,
     run_stage: str,
-    config: PreprocessingConfig,
-    default_patch_size,
-    image_reader_name: str,
-    reference_reader_name: Optional[str],
-) -> str:
+    reference_files: Optional[list[str] | str] = None,
+    reference_reader_name: Optional[str] = None,
+    reference_dataset_json: Optional[dict] = None,
+) -> None:
     from .preprocessing import TaskAwarePreprocessor
 
-    cases = spec.get("cases")
-    if not isinstance(cases, list) or len(cases) == 0:
-        raise ValueError("Spec for single-folder datasets must contain a non-empty 'cases' list")
-    output_folder.mkdir(parents=True, exist_ok=True)
     preprocessor = TaskAwarePreprocessor(config)
-    seen_identifiers: list[str] = []
-    seen_identifier_set: set[str] = set()
-    segmentation_reference = task_mode == TaskMode.SEGMENTATION
-
-    for index, case_payload in enumerate(cases):
-        context = f"cases[{index}]"
-        identifier, image_files, reference_files = _validate_case_entry(case_payload, context=context)
-        if identifier in seen_identifier_set:
-            raise ValueError(f"Duplicate identifier '{identifier}' in spec")
-        seen_identifiers.append(identifier)
-        seen_identifier_set.add(identifier)
-        if run_stage in {RunStage.TRAIN, RunStage.PREDICT_AND_EVALUATE} and task_mode in {
-            TaskMode.SEGMENTATION,
-            TaskMode.PAIRED_GENERATIVE,
-        } and reference_files is None:
-            raise ValueError(f"{context}.reference_files is required for {task_mode} {run_stage}")
-        normalized_reference_files = _normalize_reference_files(
-            reference_files,
-            segmentation_reference=segmentation_reference,
+    image_reader = _build_reader(image_reader_name, image_files[0], image_dataset_json)
+    reference_reader = None
+    if reference_files is not None:
+        reference_example = reference_files if isinstance(reference_files, str) else reference_files[0]
+        reference_reader = _build_reader(
+            reference_reader_name or image_reader_name,
+            reference_example,
+            reference_dataset_json or image_dataset_json,
         )
-        case_image_reader = _build_reader(case_payload.get("image_reader", image_reader_name), image_files[0])
-        case_reference_reader = None
-        if normalized_reference_files is not None:
-            reference_example = (
-                normalized_reference_files
-                if isinstance(normalized_reference_files, str)
-                else normalized_reference_files[0]
-            )
-            case_reference_reader = _build_reader(
-                case_payload.get("reference_reader", reference_reader_name or image_reader_name),
-                reference_example,
-            )
-        case = preprocessor.run_task_case_from_files(
-            image_files=image_files,
-            image_reader=case_image_reader,
-            task_mode=task_mode,
-            run_stage=run_stage,
-            reference_files=normalized_reference_files,
-            reference_reader=case_reference_reader,
-        )
-        save_preprocessed_case(case, str(_prepare_output_prefix(output_folder, identifier)))
-
-    return save_preprocessed_dataset(
-        folder=str(output_folder),
+    case = preprocessor.run_task_case_from_files(
+        image_files=image_files,
+        image_reader=image_reader,
         task_mode=task_mode,
         run_stage=run_stage,
+        reference_files=reference_files,
+        reference_reader=reference_reader,
+    )
+    save_preprocessed_case(case, str(_prepare_output_prefix(output_folder, identifier)))
+
+
+def _preprocess_segmentation_or_self_supervised(
+    args: argparse.Namespace,
+    config: PreprocessingConfig,
+    dataset_json: Optional[dict],
+) -> str:
+    images = _scan_image_dir(args.images_dir, "--images-dir", args.multi_image)
+    output_folder = Path(args.output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    if args.task_mode == TaskMode.SELF_SUPERVISED:
+        if args.labels_dir is not None:
+            raise ValueError("self_supervised does not accept --labels-dir")
+        for identifier in sorted(images.keys()):
+            _preprocess_case(
+                identifier=identifier,
+                image_files=images[identifier],
+                image_reader_name=args.image_reader,
+                image_dataset_json=dataset_json,
+                config=config,
+                output_folder=output_folder,
+                task_mode=TaskMode.SELF_SUPERVISED,
+                run_stage=args.run_stage,
+            )
+        return save_preprocessed_dataset(
+            folder=str(output_folder),
+            task_mode=TaskMode.SELF_SUPERVISED,
+            run_stage=args.run_stage,
+            config=config,
+            default_patch_size=args.default_patch_size,
+            identifiers=sorted(images.keys()),
+        )
+
+    if args.run_stage in {RunStage.TRAIN, RunStage.PREDICT_AND_EVALUATE}:
+        if args.labels_dir is None:
+            raise ValueError("segmentation train/predict_and_evaluate requires --labels-dir")
+    if args.run_stage == RunStage.PREDICT and args.labels_dir is not None:
+        raise ValueError("segmentation predict does not accept --labels-dir")
+
+    labels = _scan_single_image_dir(args.labels_dir, "--labels-dir") if args.labels_dir is not None else None
+    identifiers = sorted(images.keys()) if labels is None else _assert_matching_identifiers(images, labels, "images", "labels")
+    for identifier in identifiers:
+        _preprocess_case(
+            identifier=identifier,
+            image_files=images[identifier],
+            image_reader_name=args.image_reader,
+            image_dataset_json=dataset_json,
+            config=config,
+            output_folder=output_folder,
+            task_mode=TaskMode.SEGMENTATION,
+            run_stage=args.run_stage,
+            reference_files=None if labels is None else labels[identifier][0],
+            reference_reader_name=args.reference_reader,
+            reference_dataset_json=dataset_json,
+        )
+    return save_preprocessed_dataset(
+        folder=str(output_folder),
+        task_mode=TaskMode.SEGMENTATION,
+        run_stage=args.run_stage,
         config=config,
-        default_patch_size=default_patch_size,
-        identifiers=seen_identifiers,
+        default_patch_size=args.default_patch_size,
+        identifiers=identifiers,
     )
 
 
-def _preprocess_unpaired_dataset(
-    *,
-    spec: dict,
-    output_folder: Path,
-    run_stage: str,
+def _preprocess_paired(args: argparse.Namespace, config: PreprocessingConfig, dataset_json: Optional[dict]) -> str:
+    if args.source_dir is None:
+        raise ValueError("paired_generative requires --source-dir")
+    sources = _scan_image_dir(args.source_dir, "--source-dir", args.multi_image)
+    output_folder = Path(args.output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    if args.run_stage in {RunStage.TRAIN, RunStage.PREDICT_AND_EVALUATE}:
+        if args.target_dir is None:
+            raise ValueError("paired_generative train/predict_and_evaluate requires --target-dir")
+    if args.run_stage == RunStage.PREDICT and args.target_dir is not None:
+        raise ValueError("paired_generative predict does not accept --target-dir")
+
+    targets = _scan_image_dir(args.target_dir, "--target-dir", args.multi_image) if args.target_dir is not None else None
+    identifiers = (
+        sorted(sources.keys())
+        if targets is None
+        else _assert_matching_identifiers(sources, targets, "source", "target")
+    )
+    for identifier in identifiers:
+        _preprocess_case(
+            identifier=identifier,
+            image_files=sources[identifier],
+            image_reader_name=args.source_reader,
+            image_dataset_json=dataset_json,
+            config=config,
+            output_folder=output_folder,
+            task_mode=TaskMode.PAIRED_GENERATIVE,
+            run_stage=args.run_stage,
+            reference_files=None if targets is None else targets[identifier],
+            reference_reader_name=args.target_reader,
+            reference_dataset_json=dataset_json,
+        )
+    return save_preprocessed_dataset(
+        folder=str(output_folder),
+        task_mode=TaskMode.PAIRED_GENERATIVE,
+        run_stage=args.run_stage,
+        config=config,
+        default_patch_size=args.default_patch_size,
+        identifiers=identifiers,
+    )
+
+
+def _preprocess_unpaired(
+    args: argparse.Namespace,
     config_a: PreprocessingConfig,
     config_b: PreprocessingConfig,
-    default_patch_size,
-    image_reader_a_name: str,
-    image_reader_b_name: str,
-    folder_a_name: str,
-    folder_b_name: str,
+    dataset_json_a: Optional[dict],
+    dataset_json_b: Optional[dict],
 ) -> str:
-    from .preprocessing import TaskAwarePreprocessor
+    if args.domain_a_dir is None or args.domain_b_dir is None:
+        raise ValueError("unpaired_generative requires --domain-a-dir and --domain-b-dir")
+    if args.run_stage == RunStage.PREDICT_AND_EVALUATE:
+        raise ValueError("unpaired_generative does not support predict_and_evaluate")
 
-    domains = spec.get("domains")
-    if not isinstance(domains, dict):
-        raise ValueError("Spec for unpaired datasets must contain a 'domains' object")
-    cases_a = domains.get("a")
-    cases_b = domains.get("b")
-    if not isinstance(cases_a, list) or len(cases_a) == 0:
-        raise ValueError("Spec domain 'a' must be a non-empty list")
-    if not isinstance(cases_b, list) or len(cases_b) == 0:
-        raise ValueError("Spec domain 'b' must be a non-empty list")
+    domain_a = _scan_image_dir(args.domain_a_dir, "--domain-a-dir", args.multi_image)
+    domain_b = _scan_image_dir(args.domain_b_dir, "--domain-b-dir", args.multi_image)
 
+    output_folder = Path(args.output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
-    folder_a = output_folder / folder_a_name
-    folder_b = output_folder / folder_b_name
+    folder_a = output_folder / args.folder_a_name
+    folder_b = output_folder / args.folder_b_name
     folder_a.mkdir(exist_ok=True)
     folder_b.mkdir(exist_ok=True)
 
-    domain_specs = (
-        ("a", cases_a, folder_a, config_a, image_reader_a_name),
-        ("b", cases_b, folder_b, config_b, image_reader_b_name),
-    )
-    domain_identifiers: dict[str, list[str]] = {"a": [], "b": []}
-    domain_identifier_sets: dict[str, set[str]] = {"a": set(), "b": set()}
-
-    for domain_name, cases, folder, config, reader_name in domain_specs:
-        preprocessor = TaskAwarePreprocessor(config)
-        for index, case_payload in enumerate(cases):
-            context = f"domains.{domain_name}[{index}]"
-            identifier, image_files, reference_files = _validate_case_entry(case_payload, context=context)
-            if reference_files is not None:
-                raise ValueError(f"{context}.reference_files is not allowed for unpaired_generative")
-            if identifier in domain_identifier_sets[domain_name]:
-                raise ValueError(f"Duplicate identifier '{identifier}' in domain '{domain_name}'")
-            domain_identifier_sets[domain_name].add(identifier)
-            domain_identifiers[domain_name].append(identifier)
-            case_image_reader = _build_reader(case_payload.get("image_reader", reader_name), image_files[0])
-            case = preprocessor.run_task_case_from_files(
-                image_files=image_files,
-                image_reader=case_image_reader,
-                task_mode=TaskMode.UNPAIRED_GENERATIVE,
-                run_stage=run_stage,
-            )
-            save_preprocessed_case(case, str(_prepare_output_prefix(folder, identifier)))
+    for identifier in sorted(domain_a.keys()):
+        _preprocess_case(
+            identifier=identifier,
+            image_files=domain_a[identifier],
+            image_reader_name=args.domain_a_reader,
+            image_dataset_json=dataset_json_a,
+            config=config_a,
+            output_folder=folder_a,
+            task_mode=TaskMode.UNPAIRED_GENERATIVE,
+            run_stage=args.run_stage,
+        )
+    for identifier in sorted(domain_b.keys()):
+        _preprocess_case(
+            identifier=identifier,
+            image_files=domain_b[identifier],
+            image_reader_name=args.domain_b_reader,
+            image_dataset_json=dataset_json_b,
+            config=config_b,
+            output_folder=folder_b,
+            task_mode=TaskMode.UNPAIRED_GENERATIVE,
+            run_stage=args.run_stage,
+        )
 
     return save_preprocessed_dataset(
         folder=str(output_folder),
         task_mode=TaskMode.UNPAIRED_GENERATIVE,
-        run_stage=run_stage,
-        default_patch_size=default_patch_size,
-        folder_a=folder_a_name,
-        folder_b=folder_b_name,
+        run_stage=args.run_stage,
+        default_patch_size=args.default_patch_size,
+        folder_a=args.folder_a_name,
+        folder_b=args.folder_b_name,
         config_a=config_a,
         config_b=config_b,
-        identifiers_a=domain_identifiers["a"],
-        identifiers_b=domain_identifiers["b"],
+        identifiers_a=sorted(domain_a.keys()),
+        identifiers_b=sorted(domain_b.keys()),
     )
 
 
 def _preprocess_dataset_command(args: argparse.Namespace) -> int:
-    spec = _load_spec(args.spec)
     base_config = _load_config(args.config_json, args.plans_file, args.configuration_name)
     config_a = _load_config(args.config_a_json, args.plans_a_file, args.configuration_a_name)
     config_b = _load_config(args.config_b_json, args.plans_b_file, args.configuration_b_name)
-    output_folder = Path(args.output_folder)
 
     if args.task_mode == TaskMode.UNPAIRED_GENERATIVE:
-        config_a = config_a or base_config
-        config_b = config_b or base_config
-        if config_a is None or config_b is None:
-            raise ValueError(
-                "preprocess-dataset for unpaired_generative requires config for both domains. "
-                "Use --config-a-json/--config-b-json or provide a shared config with --config-json."
+        domain_a = _scan_image_dir(args.domain_a_dir, "--domain-a-dir", args.multi_image)
+        domain_b = _scan_image_dir(args.domain_b_dir, "--domain-b-dir", args.multi_image)
+        dataset_json_a = _discover_dataset_json(args.domain_a_dir)
+        dataset_json_b = _discover_dataset_json(args.domain_b_dir)
+        if base_config is not None:
+            config_a = config_a or base_config
+            config_b = config_b or base_config
+        if config_a is None:
+            config_a = _plan_config_from_cases(
+                domain_a,
+                args.domain_a_reader,
+                dataset_json=dataset_json_a,
             )
-        manifest_file = _preprocess_unpaired_dataset(
-            spec=spec,
-            output_folder=output_folder,
-            run_stage=args.run_stage,
-            config_a=config_a,
-            config_b=config_b,
-            default_patch_size=args.default_patch_size,
-            image_reader_a_name=args.image_reader_a,
-            image_reader_b_name=args.image_reader_b,
-            folder_a_name=args.folder_a_name,
-            folder_b_name=args.folder_b_name,
-        )
+        if config_b is None:
+            config_b = _plan_config_from_cases(
+                domain_b,
+                args.domain_b_reader,
+                dataset_json=dataset_json_b,
+            )
+        manifest_file = _preprocess_unpaired(args, config_a, config_b, dataset_json_a, dataset_json_b)
     else:
-        if base_config is None:
-            raise ValueError(
-                "preprocess-dataset requires --config-json or --plans-file/--configuration-name "
-                "for single-folder datasets."
-            )
-        manifest_file = _preprocess_single_folder_dataset(
-            spec=spec,
-            output_folder=output_folder,
-            task_mode=args.task_mode,
-            run_stage=args.run_stage,
-            config=base_config,
-            default_patch_size=args.default_patch_size,
-            image_reader_name=args.image_reader,
-            reference_reader_name=args.reference_reader,
-        )
+        if args.task_mode in {TaskMode.SEGMENTATION, TaskMode.SELF_SUPERVISED}:
+            if args.images_dir is None:
+                raise ValueError(f"{args.task_mode} requires --images-dir")
+            dataset_json = _discover_dataset_json(args.images_dir, args.labels_dir)
+            if base_config is None:
+                images = _scan_image_dir(args.images_dir, "--images-dir", args.multi_image)
+                labels = (
+                    _scan_single_image_dir(args.labels_dir, "--labels-dir")
+                    if args.task_mode == TaskMode.SEGMENTATION
+                    and args.run_stage in {RunStage.TRAIN, RunStage.PREDICT_AND_EVALUATE}
+                    and args.labels_dir is not None
+                    else None
+                )
+                if labels is not None:
+                    _assert_matching_identifiers(images, labels, "images", "labels")
+                base_config = _plan_config_from_cases(
+                    images,
+                    args.image_reader,
+                    dataset_json=dataset_json,
+                    reference_cases=labels,
+                )
+            manifest_file = _preprocess_segmentation_or_self_supervised(args, base_config, dataset_json)
+        elif args.task_mode == TaskMode.PAIRED_GENERATIVE:
+            if args.source_dir is None:
+                raise ValueError("paired_generative requires --source-dir")
+            dataset_json = _discover_dataset_json(args.source_dir, args.target_dir)
+            if base_config is None:
+                sources = _scan_image_dir(args.source_dir, "--source-dir", args.multi_image)
+                base_config = _plan_config_from_cases(
+                    sources,
+                    args.source_reader,
+                    dataset_json=dataset_json,
+                )
+            manifest_file = _preprocess_paired(args, base_config, dataset_json)
+        else:
+            raise ValueError(f"Unsupported task_mode '{args.task_mode}'")
 
     print(Path(manifest_file).resolve())
     return 0
@@ -439,12 +644,12 @@ def _build_config_argument_group(
     group.add_argument(
         json_flag,
         default=None,
-        help=f"Path to a JSON file that directly defines PreprocessingConfig for {label}.",
+        help=f"Optional JSON file that directly defines PreprocessingConfig for {label}.",
     )
     group.add_argument(
         plans_flag,
         default=None,
-        help=f"Path to an nnU-Net plans JSON file for {label}.",
+        help=f"Optional nnU-Net plans JSON file for {label}.",
     )
     group.add_argument(
         configuration_flag,
@@ -464,18 +669,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     preprocess_parser = subparsers.add_parser(
         "preprocess-dataset",
-        help="Read raw files, save preprocessed cases, and write preprocessing_manifest.json",
+        help="Scan raw directories, preprocess cases, and write preprocessing_manifest.json",
         description=(
-            "Read raw image files from a JSON spec, preprocess each case, save .npz/.pkl case files, "
-            "and write preprocessing_manifest.json."
+            "Scan task-specific raw data directories, match cases automatically, save .npz/.pkl "
+            "preprocessed cases, and write preprocessing_manifest.json."
         ),
         epilog=PREPROCESS_DATASET_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    preprocess_parser.add_argument(
-        "--spec",
-        required=True,
-        help="Path to a JSON file describing the cases to preprocess.",
     )
     preprocess_parser.add_argument(
         "--output-folder",
@@ -508,29 +708,69 @@ def build_parser() -> argparse.ArgumentParser:
         help="Default patch size written into the generated manifest.",
     )
     preprocess_parser.add_argument(
+        "--multi-image",
+        action="store_true",
+        help=(
+            "Treat image directories as grouped multi-image cases. "
+            "Files must follow the postfix rule case_0001_0000, case_0001_0001, ... "
+            "Single-channel files named case_0001_0000 are accepted without this flag."
+        ),
+    )
+
+    single_or_seg_group = preprocess_parser.add_argument_group("segmentation / self_supervised options")
+    single_or_seg_group.add_argument("--images-dir", default=None, help="Input image directory.")
+    single_or_seg_group.add_argument(
+        "--labels-dir",
+        default=None,
+        help="Segmentation label directory. Required for segmentation train and predict_and_evaluate.",
+    )
+    single_or_seg_group.add_argument(
         "--image-reader",
         default="auto",
         choices=READER_CHOICES,
-        help="Reader for single-folder dataset images. Default: auto.",
+        help="Reader for --images-dir. Default: auto.",
     )
-    preprocess_parser.add_argument(
+    single_or_seg_group.add_argument(
         "--reference-reader",
         default=None,
         choices=READER_CHOICES,
-        help="Reader for single-folder dataset references. Default: use the image reader.",
+        help="Reader for --labels-dir. Default: use --image-reader.",
     )
-    preprocess_domain_group = preprocess_parser.add_argument_group("unpaired dataset options")
-    preprocess_domain_group.add_argument(
-        "--image-reader-a",
+
+    paired_group = preprocess_parser.add_argument_group("paired_generative options")
+    paired_group.add_argument("--source-dir", default=None, help="Source image directory.")
+    paired_group.add_argument(
+        "--target-dir",
+        default=None,
+        help="Target image directory. Required for paired_generative train and predict_and_evaluate.",
+    )
+    paired_group.add_argument(
+        "--source-reader",
         default="auto",
         choices=READER_CHOICES,
-        help="Reader for domain A images in unpaired_generative. Default: auto.",
+        help="Reader for --source-dir. Default: auto.",
     )
+    paired_group.add_argument(
+        "--target-reader",
+        default=None,
+        choices=READER_CHOICES,
+        help="Reader for --target-dir. Default: use --source-reader.",
+    )
+
+    preprocess_domain_group = preprocess_parser.add_argument_group("unpaired_generative options")
+    preprocess_domain_group.add_argument("--domain-a-dir", default=None, help="Domain A directory.")
+    preprocess_domain_group.add_argument("--domain-b-dir", default=None, help="Domain B directory.")
     preprocess_domain_group.add_argument(
-        "--image-reader-b",
+        "--domain-a-reader",
         default="auto",
         choices=READER_CHOICES,
-        help="Reader for domain B images in unpaired_generative. Default: auto.",
+        help="Reader for --domain-a-dir. Default: auto.",
+    )
+    preprocess_domain_group.add_argument(
+        "--domain-b-reader",
+        default="auto",
+        choices=READER_CHOICES,
+        help="Reader for --domain-b-dir. Default: auto.",
     )
     preprocess_domain_group.add_argument(
         "--folder-a-name",
@@ -542,13 +782,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="domain_b",
         help="Subfolder name created under --output-folder for unpaired domain B.",
     )
+
     _build_config_argument_group(
         preprocess_parser,
-        title="single-folder dataset config",
+        title="shared config",
         json_flag="--config-json",
         plans_flag="--plans-file",
         configuration_flag="--configuration-name",
-        label="the single-folder dataset",
+        label="the dataset",
     )
     _build_config_argument_group(
         preprocess_parser,

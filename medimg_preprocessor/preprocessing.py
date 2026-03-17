@@ -270,10 +270,42 @@ class ModularPreprocessor:
             if len(target_spacing) < len(image.shape[1:]):
                 target_spacing = [spacing[0]] + target_spacing
             new_shape = compute_new_shape(image.shape[1:], spacing, target_spacing)
-            image = resample_array(image, new_shape, order=self.config.resampling.image_order)
+            image = resample_array(
+                image,
+                new_shape,
+                spacing,
+                target_spacing,
+                is_seg=False,
+                order=self.config.resampling.image_order,
+                order_z=self.config.resampling.image_order_z,
+                force_separate_z=self.config.resampling.force_separate_z,
+                separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+            )
             if target is not None:
-                order = self.config.resampling.label_order if target_is_segmentation else self.config.resampling.image_order
-                target = resample_array(target, new_shape, order=order)
+                if target_is_segmentation:
+                    target = resample_array(
+                        target,
+                        new_shape,
+                        spacing,
+                        target_spacing,
+                        is_seg=True,
+                        order=self.config.resampling.label_order,
+                        order_z=self.config.resampling.label_order_z,
+                        force_separate_z=self.config.resampling.force_separate_z,
+                        separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+                    )
+                else:
+                    target = resample_array(
+                        target,
+                        new_shape,
+                        spacing,
+                        target_spacing,
+                        is_seg=False,
+                        order=self.config.resampling.image_order,
+                        order_z=self.config.resampling.image_order_z,
+                        force_separate_z=self.config.resampling.force_separate_z,
+                        separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+                    )
             properties["spacing_after_resampling"] = target_spacing
             properties["shape_after_resampling"] = tuple(int(i) for i in new_shape)
         else:
@@ -474,8 +506,28 @@ class TaskAwarePreprocessor:
             if len(target_spacing) < len(image.shape[1:]):
                 target_spacing = [spacing[0]] + target_spacing
             new_shape = compute_new_shape(image.shape[1:], spacing, target_spacing)
-            image = resample_array(image, new_shape, self.config.resampling.image_order)
-            reference = resample_array(reference, new_shape, self.config.resampling.image_order)
+            image = resample_array(
+                image,
+                new_shape,
+                spacing,
+                target_spacing,
+                is_seg=False,
+                order=self.config.resampling.image_order,
+                order_z=self.config.resampling.image_order_z,
+                force_separate_z=self.config.resampling.force_separate_z,
+                separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+            )
+            reference = resample_array(
+                reference,
+                new_shape,
+                spacing,
+                target_spacing,
+                is_seg=False,
+                order=self.config.resampling.image_order,
+                order_z=self.config.resampling.image_order_z,
+                force_separate_z=self.config.resampling.force_separate_z,
+                separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+            )
             properties["spacing_after_resampling"] = target_spacing
             properties["shape_after_resampling"] = tuple(int(i) for i in new_shape)
         else:

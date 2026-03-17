@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 import math
+from statistics import median
 import warnings
 from typing import Dict, List, Optional, Sequence, Union
 
@@ -10,7 +11,11 @@ from typing import Dict, List, Optional, Sequence, Union
 @dataclass
 class ResamplingConfig:
     image_order: int = 3
+    image_order_z: int = 0
     label_order: int = 0
+    label_order_z: int = 0
+    force_separate_z: Optional[bool] = None
+    separate_z_anisotropy_threshold: float = 3.0
 
 
 @dataclass
@@ -56,6 +61,16 @@ class PreprocessingConfig:
                 f"Resampling orders must be non-negative, got image={self.resampling.image_order}, "
                 f"label={self.resampling.label_order}"
             )
+        if self.resampling.image_order_z < 0 or self.resampling.label_order_z < 0:
+            _fail_validation(
+                f"Z resampling orders must be non-negative, got image_z={self.resampling.image_order_z}, "
+                f"label_z={self.resampling.label_order_z}"
+            )
+        if self.resampling.separate_z_anisotropy_threshold <= 0:
+            _fail_validation(
+                "ResamplingConfig.separate_z_anisotropy_threshold must be positive, "
+                f"got {self.resampling.separate_z_anisotropy_threshold}"
+            )
 
         self.spacing = spacing
         self.transpose_forward = transpose_forward
@@ -96,8 +111,61 @@ class PreprocessingConfig:
             ),
             resampling=ResamplingConfig(
                 image_order=int(data_kwargs.get("order", 3)),
+                image_order_z=int(data_kwargs.get("order_z", 0)),
                 label_order=int(seg_kwargs.get("order", 0)),
+                label_order_z=int(seg_kwargs.get("order_z", 0)),
+                force_separate_z=data_kwargs.get("force_separate_z", None),
             ),
+        )
+
+    @classmethod
+    def infer_from_dataset(
+        cls,
+        spacings: Sequence[Sequence[float]],
+        num_channels: int,
+        *,
+        normalization_schemes: Optional[Sequence[str]] = None,
+        use_mask_for_norm: Optional[Sequence[bool]] = None,
+        foreground_intensity_properties_per_channel: Optional[Dict[str, dict]] = None,
+        transpose_forward: Optional[Sequence[int]] = None,
+        resampling: Optional[ResamplingConfig] = None,
+    ) -> "PreprocessingConfig":
+        if len(spacings) == 0:
+            _fail_validation("infer_from_dataset requires at least one spacing entry")
+        if num_channels <= 0:
+            _fail_validation(f"infer_from_dataset requires a positive num_channels, got {num_channels}")
+
+        normalized_spacings = [tuple(float(i) for i in spacing) for spacing in spacings]
+        dims = len(normalized_spacings[0])
+        if dims == 0:
+            _fail_validation("spacing entries must contain at least one dimension")
+        for spacing in normalized_spacings:
+            if len(spacing) != dims:
+                _fail_validation(
+                    f"All spacing entries must have the same dimensionality, got {dims} and {len(spacing)}"
+                )
+            if any(not math.isfinite(i) or i <= 0 for i in spacing):
+                _fail_validation(f"All spacing values must be finite and positive, got {spacing}")
+
+        target_spacing = tuple(median(spacing[dim] for spacing in normalized_spacings) for dim in range(dims))
+        if transpose_forward is None:
+            transpose_forward = tuple(range(dims))
+        if normalization_schemes is None:
+            normalization_schemes = tuple("zscore" for _ in range(num_channels))
+        if use_mask_for_norm is None:
+            use_mask_for_norm = tuple(False for _ in range(num_channels))
+        if foreground_intensity_properties_per_channel is None:
+            foreground_intensity_properties_per_channel = {}
+        if resampling is None:
+            resampling = ResamplingConfig()
+
+        return cls(
+            spacing=target_spacing,
+            transpose_forward=transpose_forward,
+            normalization_schemes=normalization_schemes,
+            use_mask_for_norm=use_mask_for_norm,
+            foreground_intensity_properties_per_channel=foreground_intensity_properties_per_channel,
+            resampling=resampling,
         )
 
 
