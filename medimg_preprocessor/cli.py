@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -87,6 +88,37 @@ SUPPORTED_SCAN_ENDINGS = (
 )
 
 MULTI_IMAGE_PATTERN = re.compile(r"^(?P<identifier>.+_\d{4})_(?P<channel>\d{4})$")
+
+
+def _log_stage(step: int, total_steps: int, title: str, detail: Optional[str] = None) -> None:
+    message = f"[{step}/{total_steps}] {title}"
+    if detail:
+        message += f": {detail}"
+    print(message, flush=True)
+
+
+def _format_progress(current: int, total: int, width: int = 28) -> str:
+    if total <= 0:
+        total = 1
+    filled = int(round(width * current / total))
+    filled = max(0, min(width, filled))
+    return "[" + "#" * filled + "-" * (width - filled) + f"] {current}/{total}"
+
+
+def _run_case_progress(
+    label: str,
+    identifiers: Sequence[str],
+    runner,
+) -> None:
+    total = len(identifiers)
+    if total == 0:
+        return
+    for index, identifier in enumerate(identifiers, start=1):
+        sys.stdout.write(f"\r  {label:<12} {_format_progress(index, total)}")
+        sys.stdout.flush()
+        runner(identifier)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
 def _load_config_from_json(path: Optional[str]) -> Optional[PreprocessingConfig]:
@@ -382,7 +414,9 @@ def _preprocess_segmentation_or_self_supervised(
     if args.task_mode == TaskMode.SELF_SUPERVISED:
         if args.labels_dir is not None:
             raise ValueError("self_supervised does not accept --labels-dir")
-        for identifier in sorted(images.keys()):
+        identifiers = sorted(images.keys())
+
+        def _runner(identifier: str) -> None:
             _preprocess_case(
                 identifier=identifier,
                 image_files=images[identifier],
@@ -393,13 +427,14 @@ def _preprocess_segmentation_or_self_supervised(
                 task_mode=TaskMode.SELF_SUPERVISED,
                 run_stage=args.run_stage,
             )
+        _run_case_progress("cases", identifiers, _runner)
         return save_preprocessed_dataset(
             folder=str(output_folder),
             task_mode=TaskMode.SELF_SUPERVISED,
             run_stage=args.run_stage,
             config=config,
             default_patch_size=args.default_patch_size,
-            identifiers=sorted(images.keys()),
+            identifiers=identifiers,
         )
 
     if args.run_stage in {RunStage.TRAIN, RunStage.PREDICT_AND_EVALUATE}:
@@ -410,7 +445,8 @@ def _preprocess_segmentation_or_self_supervised(
 
     labels = _scan_single_image_dir(args.labels_dir, "--labels-dir") if args.labels_dir is not None else None
     identifiers = sorted(images.keys()) if labels is None else _assert_matching_identifiers(images, labels, "images", "labels")
-    for identifier in identifiers:
+
+    def _runner(identifier: str) -> None:
         _preprocess_case(
             identifier=identifier,
             image_files=images[identifier],
@@ -424,6 +460,7 @@ def _preprocess_segmentation_or_self_supervised(
             reference_reader_name=args.reference_reader,
             reference_dataset_json=dataset_json,
         )
+    _run_case_progress("cases", identifiers, _runner)
     return save_preprocessed_dataset(
         folder=str(output_folder),
         task_mode=TaskMode.SEGMENTATION,
@@ -453,7 +490,8 @@ def _preprocess_paired(args: argparse.Namespace, config: PreprocessingConfig, da
         if targets is None
         else _assert_matching_identifiers(sources, targets, "source", "target")
     )
-    for identifier in identifiers:
+
+    def _runner(identifier: str) -> None:
         _preprocess_case(
             identifier=identifier,
             image_files=sources[identifier],
@@ -467,6 +505,7 @@ def _preprocess_paired(args: argparse.Namespace, config: PreprocessingConfig, da
             reference_reader_name=args.target_reader,
             reference_dataset_json=dataset_json,
         )
+    _run_case_progress("cases", identifiers, _runner)
     return save_preprocessed_dataset(
         folder=str(output_folder),
         task_mode=TaskMode.PAIRED_GENERATIVE,
@@ -499,7 +538,10 @@ def _preprocess_unpaired(
     folder_a.mkdir(exist_ok=True)
     folder_b.mkdir(exist_ok=True)
 
-    for identifier in sorted(domain_a.keys()):
+    identifiers_a = sorted(domain_a.keys())
+    identifiers_b = sorted(domain_b.keys())
+
+    def _runner_a(identifier: str) -> None:
         _preprocess_case(
             identifier=identifier,
             image_files=domain_a[identifier],
@@ -510,7 +552,7 @@ def _preprocess_unpaired(
             task_mode=TaskMode.UNPAIRED_GENERATIVE,
             run_stage=args.run_stage,
         )
-    for identifier in sorted(domain_b.keys()):
+    def _runner_b(identifier: str) -> None:
         _preprocess_case(
             identifier=identifier,
             image_files=domain_b[identifier],
@@ -521,6 +563,8 @@ def _preprocess_unpaired(
             task_mode=TaskMode.UNPAIRED_GENERATIVE,
             run_stage=args.run_stage,
         )
+    _run_case_progress("domain A", identifiers_a, _runner_a)
+    _run_case_progress("domain B", identifiers_b, _runner_b)
 
     return save_preprocessed_dataset(
         folder=str(output_folder),
@@ -531,12 +575,14 @@ def _preprocess_unpaired(
         folder_b=args.folder_b_name,
         config_a=config_a,
         config_b=config_b,
-        identifiers_a=sorted(domain_a.keys()),
-        identifiers_b=sorted(domain_b.keys()),
+        identifiers_a=identifiers_a,
+        identifiers_b=identifiers_b,
     )
 
 
 def _preprocess_dataset_command(args: argparse.Namespace) -> int:
+    total_steps = 4
+    _log_stage(1, total_steps, "Scan dataset", f"task_mode={args.task_mode}")
     base_config = _load_config(args.config_json, args.plans_file, args.configuration_name)
     config_a = _load_config(args.config_a_json, args.plans_a_file, args.configuration_a_name)
     config_b = _load_config(args.config_b_json, args.plans_b_file, args.configuration_b_name)
@@ -544,6 +590,7 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
     if args.task_mode == TaskMode.UNPAIRED_GENERATIVE:
         domain_a = _scan_image_dir(args.domain_a_dir, "--domain-a-dir", args.multi_image)
         domain_b = _scan_image_dir(args.domain_b_dir, "--domain-b-dir", args.multi_image)
+        _log_stage(2, total_steps, "Plan preprocessing", f"domain_a={len(domain_a)} cases, domain_b={len(domain_b)} cases")
         dataset_json_a = _discover_dataset_json(args.domain_a_dir)
         dataset_json_b = _discover_dataset_json(args.domain_b_dir)
         if base_config is not None:
@@ -561,45 +608,68 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                 args.domain_b_reader,
                 dataset_json=dataset_json_b,
             )
+        _log_stage(3, total_steps, "Preprocess cases", "writing preprocessed domain folders")
         manifest_file = _preprocess_unpaired(args, config_a, config_b, dataset_json_a, dataset_json_b)
     else:
         if args.task_mode in {TaskMode.SEGMENTATION, TaskMode.SELF_SUPERVISED}:
             if args.images_dir is None:
                 raise ValueError(f"{args.task_mode} requires --images-dir")
             dataset_json = _discover_dataset_json(args.images_dir, args.labels_dir)
+            images = _scan_image_dir(args.images_dir, "--images-dir", args.multi_image)
+            labels = (
+                _scan_single_image_dir(args.labels_dir, "--labels-dir")
+                if args.task_mode == TaskMode.SEGMENTATION
+                and args.run_stage in {RunStage.TRAIN, RunStage.PREDICT_AND_EVALUATE}
+                and args.labels_dir is not None
+                else None
+            )
+            if labels is not None:
+                _assert_matching_identifiers(images, labels, "images", "labels")
+            _log_stage(
+                2,
+                total_steps,
+                "Plan preprocessing",
+                f"cases={len(images)}" + (", using dataset.json" if dataset_json is not None else ""),
+            )
             if base_config is None:
-                images = _scan_image_dir(args.images_dir, "--images-dir", args.multi_image)
-                labels = (
-                    _scan_single_image_dir(args.labels_dir, "--labels-dir")
-                    if args.task_mode == TaskMode.SEGMENTATION
-                    and args.run_stage in {RunStage.TRAIN, RunStage.PREDICT_AND_EVALUATE}
-                    and args.labels_dir is not None
-                    else None
-                )
-                if labels is not None:
-                    _assert_matching_identifiers(images, labels, "images", "labels")
                 base_config = _plan_config_from_cases(
                     images,
                     args.image_reader,
                     dataset_json=dataset_json,
                     reference_cases=labels,
                 )
+            _log_stage(3, total_steps, "Preprocess cases", "writing preprocessed case files")
             manifest_file = _preprocess_segmentation_or_self_supervised(args, base_config, dataset_json)
         elif args.task_mode == TaskMode.PAIRED_GENERATIVE:
             if args.source_dir is None:
                 raise ValueError("paired_generative requires --source-dir")
             dataset_json = _discover_dataset_json(args.source_dir, args.target_dir)
+            sources = _scan_image_dir(args.source_dir, "--source-dir", args.multi_image)
+            targets = (
+                _scan_image_dir(args.target_dir, "--target-dir", args.multi_image)
+                if args.target_dir is not None and args.run_stage in {RunStage.TRAIN, RunStage.PREDICT_AND_EVALUATE}
+                else None
+            )
+            if targets is not None:
+                _assert_matching_identifiers(sources, targets, "source", "target")
+            _log_stage(
+                2,
+                total_steps,
+                "Plan preprocessing",
+                f"cases={len(sources)}" + (", using dataset.json" if dataset_json is not None else ""),
+            )
             if base_config is None:
-                sources = _scan_image_dir(args.source_dir, "--source-dir", args.multi_image)
                 base_config = _plan_config_from_cases(
                     sources,
                     args.source_reader,
                     dataset_json=dataset_json,
                 )
+            _log_stage(3, total_steps, "Preprocess cases", "writing preprocessed case files")
             manifest_file = _preprocess_paired(args, base_config, dataset_json)
         else:
             raise ValueError(f"Unsupported task_mode '{args.task_mode}'")
 
+    _log_stage(4, total_steps, "Write manifest", Path(manifest_file).name)
     print(Path(manifest_file).resolve())
     return 0
 
