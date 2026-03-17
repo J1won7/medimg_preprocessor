@@ -75,6 +75,7 @@ class RGBTo01Normalization(ImageNormalization):
 
 NORMALIZATION_REGISTRY: Dict[str, Type[ImageNormalization]] = {
     "zscore": ZScoreNormalization,
+    "zscorenormalization": ZScoreNormalization,
     "ctnormalization": CTNormalization,
     "ct": CTNormalization,
     "nonormalization": NoNormalization,

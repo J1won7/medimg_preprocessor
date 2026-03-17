@@ -28,6 +28,8 @@ class PreprocessingConfig:
     resampling: ResamplingConfig = field(default_factory=ResamplingConfig)
 
     def __post_init__(self) -> None:
+        from .normalization import get_normalizer
+
         spacing = tuple(float(i) for i in self.spacing)
         transpose_forward = tuple(int(i) for i in self.transpose_forward)
         normalization_schemes = tuple(str(i) for i in self.normalization_schemes)
@@ -56,6 +58,8 @@ class PreprocessingConfig:
                 "PreprocessingConfig.use_mask_for_norm must match normalization_schemes length, "
                 f"got {len(use_mask_for_norm)} and {len(normalization_schemes)}"
             )
+        for scheme in normalization_schemes:
+            get_normalizer(scheme)
         if self.resampling.image_order < 0 or self.resampling.label_order < 0:
             _fail_validation(
                 f"Resampling orders must be non-negative, got image={self.resampling.image_order}, "
