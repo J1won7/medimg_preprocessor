@@ -22,6 +22,7 @@
 - `2d / 3d` 기본 configuration 생성
 - configuration별 `patch_size` 계산
 - configuration별 `recommended_batch_size` 계산
+- train 단계에서는 자동 `train / val` split 생성
 - 전처리 결과 저장
 - `preprocessing_manifest.json` 생성
 
@@ -231,6 +232,7 @@ python -m medimg_preprocessor preprocess-dataset \
 - `configurations["2d"]`
 - `configurations["3d"]`
 - `default_patch_size`
+- `splits["train"]`, `splits["val"]`
 - `storage_format`
 
 즉 `nnU-Net의 plans.json과 비슷한 역할을 현재 라이브러리에서는 manifest가 담당`한다고 보면 됩니다.
@@ -307,6 +309,24 @@ dataset = load_preprocessed_dataset(
 1. `load_preprocessed_dataset(..., patch_size=...)`
 2. `configuration="2d" | "3d"`에 저장된 patch size
 3. manifest의 `default_patch_size`
+
+### train / val split으로 로드
+
+train 단계로 전처리했다면 manifest에 split이 자동 저장됩니다.
+
+```python
+from medimg_preprocessor import load_preprocessed_dataset
+
+train_dataset = load_preprocessed_dataset("preprocessed", split="train")
+val_dataset = load_preprocessed_dataset("preprocessed", split="val")
+```
+
+unpaired도 동일하게 사용할 수 있습니다.
+
+```python
+train_dataset = load_preprocessed_dataset("preprocessed_unpaired", split="train")
+val_dataset = load_preprocessed_dataset("preprocessed_unpaired", split="val")
+```
 
 ## task별 반환 키
 

@@ -75,6 +75,37 @@ def _normalize_configuration_plans(configurations: Optional[Dict[str, dict]]) ->
     return normalized
 
 
+def _build_split_mapping(
+    identifiers: Sequence[str],
+    *,
+    val_ratio: float,
+    split_seed: int,
+    label: str,
+) -> Optional[dict]:
+    if val_ratio <= 0:
+        return None
+    identifiers = [str(i) for i in identifiers]
+    if len(identifiers) < 2:
+        _fail_validation(f"{label} requires at least 2 cases to create an automatic train/val split")
+    if not (0 < val_ratio < 1):
+        _fail_validation(f"{label} val_ratio must be in the open interval (0, 1), got {val_ratio}")
+    rng = np.random.RandomState(int(split_seed))
+    shuffled = list(identifiers)
+    rng.shuffle(shuffled)
+    val_count = max(1, int(round(len(shuffled) * float(val_ratio))))
+    val_count = min(val_count, len(shuffled) - 1)
+    val_identifiers = sorted(shuffled[:val_count])
+    train_identifiers = sorted(shuffled[val_count:])
+    if len(train_identifiers) == 0 or len(val_identifiers) == 0:
+        _fail_validation(f"{label} automatic split must produce non-empty train and val sets")
+    return {
+        "train": train_identifiers,
+        "val": val_identifiers,
+        "val_ratio": float(val_ratio),
+        "split_seed": int(split_seed),
+    }
+
+
 def _validate_task_mode(task_mode: str) -> None:
     valid = {
         TaskMode.SEGMENTATION,
@@ -247,6 +278,8 @@ def save_preprocessed_dataset_manifest(
     default_configuration: Optional[str] = None,
     configurations: Optional[Dict[str, dict]] = None,
     identifiers: Optional[Sequence[str]] = None,
+    val_ratio: float = 0.2,
+    split_seed: int = 42,
     storage_format: str = DEFAULT_STORAGE_FORMAT,
 ) -> str:
     if not os.path.isdir(folder):
@@ -255,6 +288,7 @@ def save_preprocessed_dataset_manifest(
     _validate_run_stage(run_stage)
     if task_mode == TaskMode.UNPAIRED_GENERATIVE:
         _fail_validation("Use save_unpaired_preprocessed_dataset_manifest for unpaired_generative datasets")
+    manifest_identifiers = list(identifiers) if identifiers is not None else _list_identifiers(folder)
     manifest = {
         "format_version": 1,
         "task_mode": task_mode,
@@ -264,7 +298,15 @@ def save_preprocessed_dataset_manifest(
         "default_patch_size": None if default_patch_size is None else [int(i) for i in default_patch_size],
         "default_configuration": default_configuration,
         "configurations": _normalize_configuration_plans(configurations),
-        "identifiers": list(identifiers) if identifiers is not None else _list_identifiers(folder),
+        "identifiers": manifest_identifiers,
+        "splits": _build_split_mapping(
+            manifest_identifiers,
+            val_ratio=val_ratio,
+            split_seed=split_seed,
+            label=f"{task_mode} dataset",
+        )
+        if run_stage == RunStage.TRAIN
+        else None,
         "preprocessing_config": _serialize_config(config),
     }
     manifest_file = os.path.join(folder, MANIFEST_FILENAME)
@@ -282,6 +324,8 @@ def save_preprocessed_dataset(
     default_configuration: Optional[str] = None,
     configurations: Optional[Dict[str, dict]] = None,
     identifiers: Optional[Sequence[str]] = None,
+    val_ratio: float = 0.2,
+    split_seed: int = 42,
     folder_a: Optional[str] = None,
     folder_b: Optional[str] = None,
     config_a: Optional[PreprocessingConfig] = None,
@@ -308,6 +352,8 @@ def save_preprocessed_dataset(
             configurations=configurations,
             identifiers_a=identifiers_a,
             identifiers_b=identifiers_b,
+            val_ratio=val_ratio,
+            split_seed=split_seed,
             random_pairing=random_pairing,
             storage_format=storage_format,
         )
@@ -326,6 +372,8 @@ def save_preprocessed_dataset(
         default_configuration=default_configuration,
         configurations=configurations,
         identifiers=identifiers,
+        val_ratio=val_ratio,
+        split_seed=split_seed,
         storage_format=storage_format,
     )
 
@@ -343,6 +391,8 @@ def save_unpaired_preprocessed_dataset_manifest(
     configurations: Optional[Dict[str, dict]] = None,
     identifiers_a: Optional[Sequence[str]] = None,
     identifiers_b: Optional[Sequence[str]] = None,
+    val_ratio: float = 0.2,
+    split_seed: int = 42,
     random_pairing: bool = True,
     storage_format: str = DEFAULT_STORAGE_FORMAT,
 ) -> str:
@@ -357,6 +407,8 @@ def save_unpaired_preprocessed_dataset_manifest(
         _fail_validation(f"Domain A folder does not exist: {folder_a_abs}")
     if not os.path.isdir(folder_b_abs):
         _fail_validation(f"Domain B folder does not exist: {folder_b_abs}")
+    manifest_identifiers_a = list(identifiers_a) if identifiers_a is not None else _list_identifiers(folder_a_abs)
+    manifest_identifiers_b = list(identifiers_b) if identifiers_b is not None else _list_identifiers(folder_b_abs)
     manifest = {
         "format_version": 1,
         "task_mode": TaskMode.UNPAIRED_GENERATIVE,
@@ -370,12 +422,28 @@ def save_unpaired_preprocessed_dataset_manifest(
         "domains": {
             "a": {
                 "folder": os.path.relpath(folder_a_abs, root_folder),
-                "identifiers": list(identifiers_a) if identifiers_a is not None else _list_identifiers(folder_a_abs),
+                "identifiers": manifest_identifiers_a,
+                "splits": _build_split_mapping(
+                    manifest_identifiers_a,
+                    val_ratio=val_ratio,
+                    split_seed=split_seed,
+                    label="unpaired domain A",
+                )
+                if run_stage == RunStage.TRAIN
+                else None,
                 "preprocessing_config": _serialize_config(config_a),
             },
             "b": {
                 "folder": os.path.relpath(folder_b_abs, root_folder),
-                "identifiers": list(identifiers_b) if identifiers_b is not None else _list_identifiers(folder_b_abs),
+                "identifiers": manifest_identifiers_b,
+                "splits": _build_split_mapping(
+                    manifest_identifiers_b,
+                    val_ratio=val_ratio,
+                    split_seed=split_seed,
+                    label="unpaired domain B",
+                )
+                if run_stage == RunStage.TRAIN
+                else None,
                 "preprocessing_config": _serialize_config(config_b),
             },
         },
@@ -415,6 +483,12 @@ def load_preprocessed_dataset_manifest(folder: str) -> dict:
         _fail_validation("Manifest 'default_patch_size' must be a list when provided")
     if manifest.get("default_configuration") is not None and not isinstance(manifest["default_configuration"], str):
         _fail_validation("Manifest 'default_configuration' must be a string when provided")
+    if manifest.get("splits") is not None:
+        if not isinstance(manifest["splits"], dict):
+            _fail_validation("Manifest 'splits' must be a dict when provided")
+        for split_name in ("train", "val"):
+            if split_name not in manifest["splits"] or not isinstance(manifest["splits"][split_name], list):
+                _fail_validation(f"Manifest 'splits' must contain a list '{split_name}'")
     if manifest.get("configurations") is not None:
         if not isinstance(manifest["configurations"], dict):
             _fail_validation("Manifest 'configurations' must be a dict when provided")
@@ -446,6 +520,15 @@ def load_preprocessed_dataset_manifest(folder: str) -> dict:
                 _fail_validation(
                     f"Unpaired manifest domain '{domain_key}' must contain a list 'identifiers' when provided"
                 )
+            splits = domains[domain_key].get("splits")
+            if splits is not None:
+                if not isinstance(splits, dict):
+                    _fail_validation(f"Unpaired manifest domain '{domain_key}' must contain a dict 'splits'")
+                for split_name in ("train", "val"):
+                    if split_name not in splits or not isinstance(splits[split_name], list):
+                        _fail_validation(
+                            f"Unpaired manifest domain '{domain_key}' splits must contain a list '{split_name}'"
+                        )
     return manifest
 
 
@@ -795,12 +878,15 @@ def load_preprocessed_dataset(
     *,
     patch_size: Optional[Sequence[int]] = None,
     configuration: Optional[str] = None,
+    split: Optional[str] = None,
     transform: Optional[Callable[[Dict], Dict]] = None,
     seed: int = 1234,
     random_pairing: Optional[bool] = None,
     view_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> Dataset:
     manifest = load_preprocessed_dataset_manifest(folder)
+    if split is not None and split not in {"train", "val"}:
+        _fail_validation(f"split must be one of None, 'train', or 'val', got '{split}'")
     manifest_patch_size = manifest.get("default_patch_size")
     manifest_configurations = manifest.get("configurations") or {}
     effective_configuration = configuration if configuration is not None else manifest.get("default_configuration")
@@ -818,11 +904,20 @@ def load_preprocessed_dataset(
         domains = manifest["domains"]
         folder_a = os.path.join(folder, domains["a"]["folder"])
         folder_b = os.path.join(folder, domains["b"]["folder"])
+        identifiers_a = domains["a"].get("identifiers")
+        identifiers_b = domains["b"].get("identifiers")
+        if split is not None:
+            splits_a = domains["a"].get("splits")
+            splits_b = domains["b"].get("splits")
+            if splits_a is None or splits_b is None:
+                _fail_validation("Requested split loading but the manifest does not contain unpaired domain splits")
+            identifiers_a = splits_a[split]
+            identifiers_b = splits_b[split]
         return UnpairedGenerativeDataset(
             folder_a=folder_a,
             folder_b=folder_b,
-            identifiers_a=domains["a"].get("identifiers"),
-            identifiers_b=domains["b"].get("identifiers"),
+            identifiers_a=identifiers_a,
+            identifiers_b=identifiers_b,
             patch_size=effective_patch_size,
             transform=transform,
             random_pairing=manifest.get("random_pairing", True) if random_pairing is None else random_pairing,
@@ -830,6 +925,11 @@ def load_preprocessed_dataset(
         )
 
     identifiers = manifest.get("identifiers")
+    if split is not None:
+        splits = manifest.get("splits")
+        if splits is None:
+            _fail_validation("Requested split loading but the manifest does not contain train/val splits")
+        identifiers = splits[split]
     common_kwargs: Dict[str, Any] = {
         "folder": folder,
         "identifiers": identifiers,

@@ -537,6 +537,8 @@ def _preprocess_segmentation_or_self_supervised(
             default_configuration=default_configuration,
             configurations=configurations,
             identifiers=identifiers,
+            val_ratio=args.val_ratio,
+            split_seed=args.split_seed,
             storage_format=args.storage_format,
         )
 
@@ -576,6 +578,8 @@ def _preprocess_segmentation_or_self_supervised(
         default_configuration=default_configuration,
         configurations=configurations,
         identifiers=identifiers,
+        val_ratio=args.val_ratio,
+        split_seed=args.split_seed,
         storage_format=args.storage_format,
     )
 
@@ -634,6 +638,8 @@ def _preprocess_paired(
         default_configuration=default_configuration,
         configurations=configurations,
         identifiers=identifiers,
+        val_ratio=args.val_ratio,
+        split_seed=args.split_seed,
         storage_format=args.storage_format,
     )
 
@@ -711,6 +717,8 @@ def _preprocess_unpaired(
         config_b=config_b,
         identifiers_a=identifiers_a,
         identifiers_b=identifiers_b,
+        val_ratio=args.val_ratio,
+        split_seed=args.split_seed,
         storage_format=args.storage_format,
     )
 
@@ -870,6 +878,8 @@ def _save_dataset_command(args: argparse.Namespace) -> int:
         run_stage=args.run_stage,
         config=config,
         default_patch_size=args.default_patch_size,
+        val_ratio=args.val_ratio,
+        split_seed=args.split_seed,
         folder_a=args.folder_a,
         folder_b=args.folder_b,
         config_a=config_a,
@@ -974,6 +984,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=max(1, (os.cpu_count() or 1) // 2),
         help="planning/preprocessing에 사용할 worker process 수. 기본값: 사용 가능한 CPU의 절반",
+    )
+    preprocess_parser.add_argument(
+        "--val-ratio",
+        type=float,
+        default=0.2,
+        help="train 단계에서 자동 validation split에 사용할 비율. 기본값: 0.2",
+    )
+    preprocess_parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=42,
+        help="자동 train/val split에 사용할 random seed. 기본값: 42",
     )
     preprocess_parser.add_argument(
         "--multi-image",
@@ -1125,6 +1147,18 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("blosc2", "npz"),
         default="blosc2",
         help="manifest에 기록할 저장 포맷. 기본값: blosc2",
+    )
+    save_parser.add_argument(
+        "--val-ratio",
+        type=float,
+        default=0.2,
+        help="train 단계 manifest에 기록할 validation split 비율. 기본값: 0.2",
+    )
+    save_parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=42,
+        help="train 단계 manifest에 기록할 split seed. 기본값: 42",
     )
     domain_group = save_parser.add_argument_group("unpaired dataset 옵션")
     domain_group.add_argument(
