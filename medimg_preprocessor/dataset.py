@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import asdict
 import json
@@ -731,7 +731,7 @@ def _patch_key(patch_size: Sequence[int]) -> str:
 
 def _integral_sum_nd(integral: np.ndarray, starts: Sequence[int], patch_size: Sequence[int]) -> int:
     dims = len(patch_size)
-    ends = [int(s) + int(p) - 1 for s, p in zip(starts, patch_size)]
+    ends = [min(int(s) + int(p) - 1, int(integral.shape[axis]) - 1) for axis, (s, p) in enumerate(zip(starts, patch_size))]
     total = 0.0
     for mask_bits in range(1 << dims):
         index = []
@@ -778,7 +778,8 @@ def _compute_patch_sampling_starts(
     integral = foreground.astype(np.int32)
     for axis in range(integral.ndim):
         integral = integral.cumsum(axis=axis)
-    min_count = float(np.prod(target)) * float(min_fraction)
+    effective_patch_voxels = float(np.prod([min(dim, size) for dim, size in zip(spatial_shape, target)]))
+    min_count = effective_patch_voxels * float(min_fraction)
     valid_starts: list[list[int]] = []
     for starts_idx in np.ndindex(*(len(values) for values in axes)):
         starts = tuple(axes[axis][idx] for axis, idx in enumerate(starts_idx))
