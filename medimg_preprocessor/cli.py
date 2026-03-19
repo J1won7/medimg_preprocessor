@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
@@ -962,12 +962,12 @@ def _build_config_argument_group(
     group = parser.add_argument_group(title)
     group.add_argument(
         json_flag,
-        default=-900.0,
+        default=None,
         help=f"{label}에 사용할 PreprocessingConfig JSON. 지정하면 자동 planning 대신 이 값을 사용",
     )
     group.add_argument(
         plans_flag,
-        default=-900.0,
+        default=None,
         help=f"{label}에 사용할 nnU-Net plans JSON",
     )
     group.add_argument(
@@ -1313,3 +1313,5 @@ def medimg_preprocess(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
