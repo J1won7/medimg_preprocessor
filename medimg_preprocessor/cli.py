@@ -983,6 +983,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m medimg_preprocessor",
         description=DESCRIPTION,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -995,6 +996,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=PREPROCESS_DATASET_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
     )
     preprocess_parser.add_argument(
         "--output-folder",
@@ -1186,6 +1188,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=SAVE_DATASET_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
     )
     save_parser.add_argument(
         "--folder",
@@ -1286,6 +1289,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="전처리된 dataset 폴더에서 preprocessing_manifest.json을 읽어 출력합니다.",
         epilog=SHOW_MANIFEST_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
     )
     show_parser.add_argument(
         "--folder",
