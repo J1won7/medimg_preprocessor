@@ -1160,19 +1160,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--patch-foreground-min-fraction",
         type=float,
         default=0.0,
-        help="저장할 patch 후보가 포함해야 하는 foreground 최소 비율 [0, 1]. 0이면 비활성화",
+        help="Minimum foreground fraction in a patch required for a start location to be stored. Set 0 to disable.",
     )
     preprocess_parser.add_argument(
         "--patch-foreground-source",
         choices=("image", "target"),
         default="image",
-        help="foreground mask를 만들 때 기준으로 사용할 배열",
+        help="Array used to build the foreground mask for patch sampling metadata.",
     )
     preprocess_parser.add_argument(
         "--patch-foreground-max-starts",
         type=int,
         default=8192,
-        help="patch size별로 metadata에 저장할 valid patch 시작 위치 최대 개수",
+        help="Maximum number of valid patch start locations to store per patch size.",
     )
 
     preprocess_parser.set_defaults(func=_preprocess_dataset_command)
