@@ -61,6 +61,8 @@ class TaskPreprocessedCase:
     task_mode: Optional[str] = None
     run_stage: Optional[str] = None
     reference_type: Optional[str] = None
+    patch_sampling_image: Optional[np.ndarray] = None
+    patch_sampling_target: Optional[np.ndarray] = None
 
 
 def _fail_validation(message: str) -> None:
@@ -260,6 +262,9 @@ class ModularPreprocessor:
                 mask = create_nonzero_mask(image)
         properties["shape_after_cropping_and_before_resampling"] = image.shape[1:]
 
+        patch_sampling_image = image.copy()
+        patch_sampling_target = None if target is None else target.copy()
+
         if settings.normalize:
             if mask is None and settings.use_nonzero_mask_for_norm_if_no_target and any(self.config.use_mask_for_norm):
                 mask = create_nonzero_mask(image)
@@ -272,6 +277,17 @@ class ModularPreprocessor:
             new_shape = compute_new_shape(image.shape[1:], spacing, target_spacing)
             image = resample_array(
                 image,
+                new_shape,
+                spacing,
+                target_spacing,
+                is_seg=False,
+                order=self.config.resampling.image_order,
+                order_z=self.config.resampling.image_order_z,
+                force_separate_z=self.config.resampling.force_separate_z,
+                separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+            )
+            patch_sampling_image = resample_array(
+                patch_sampling_image,
                 new_shape,
                 spacing,
                 target_spacing,
@@ -294,6 +310,18 @@ class ModularPreprocessor:
                         force_separate_z=self.config.resampling.force_separate_z,
                         separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
                     )
+                    if patch_sampling_target is not None:
+                        patch_sampling_target = resample_array(
+                            patch_sampling_target,
+                            new_shape,
+                            spacing,
+                            target_spacing,
+                            is_seg=True,
+                            order=self.config.resampling.label_order,
+                            order_z=self.config.resampling.label_order_z,
+                            force_separate_z=self.config.resampling.force_separate_z,
+                            separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+                        )
                 else:
                     target = resample_array(
                         target,
@@ -306,6 +334,18 @@ class ModularPreprocessor:
                         force_separate_z=self.config.resampling.force_separate_z,
                         separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
                     )
+                    if patch_sampling_target is not None:
+                        patch_sampling_target = resample_array(
+                            patch_sampling_target,
+                            new_shape,
+                            spacing,
+                            target_spacing,
+                            is_seg=False,
+                            order=self.config.resampling.image_order,
+                            order_z=self.config.resampling.image_order_z,
+                            force_separate_z=self.config.resampling.force_separate_z,
+                            separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+                        )
             properties["spacing_after_resampling"] = target_spacing
             properties["shape_after_resampling"] = tuple(int(i) for i in new_shape)
         else:
@@ -319,6 +359,8 @@ class ModularPreprocessor:
             target = None
         if target is not None and target_is_segmentation:
             target = target.astype(np.int16 if (np.max(target) > 127 or np.min(target) < -128) else np.int8, copy=False)
+        properties["__patch_sampling_image"] = patch_sampling_image
+        properties["__patch_sampling_target"] = patch_sampling_target
         return image, target, properties
 
 
@@ -489,6 +531,9 @@ class TaskAwarePreprocessor:
                 mask = create_nonzero_mask(np.vstack((image, reference)))
         properties["shape_after_cropping_and_before_resampling"] = image.shape[1:]
 
+        patch_sampling_image = image.copy()
+        patch_sampling_reference = reference.copy()
+
         if settings.normalize:
             image = self.generative_preprocessor._normalize(
                 image,
@@ -517,8 +562,30 @@ class TaskAwarePreprocessor:
                 force_separate_z=self.config.resampling.force_separate_z,
                 separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
             )
+            patch_sampling_image = resample_array(
+                patch_sampling_image,
+                new_shape,
+                spacing,
+                target_spacing,
+                is_seg=False,
+                order=self.config.resampling.image_order,
+                order_z=self.config.resampling.image_order_z,
+                force_separate_z=self.config.resampling.force_separate_z,
+                separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+            )
             reference = resample_array(
                 reference,
+                new_shape,
+                spacing,
+                target_spacing,
+                is_seg=False,
+                order=self.config.resampling.image_order,
+                order_z=self.config.resampling.image_order_z,
+                force_separate_z=self.config.resampling.force_separate_z,
+                separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+            )
+            patch_sampling_reference = resample_array(
+                patch_sampling_reference,
                 new_shape,
                 spacing,
                 target_spacing,
@@ -533,6 +600,8 @@ class TaskAwarePreprocessor:
         else:
             properties["spacing_after_resampling"] = spacing
             properties["shape_after_resampling"] = image.shape[1:]
+        properties["__patch_sampling_image"] = patch_sampling_image
+        properties["__patch_sampling_target"] = patch_sampling_reference
         return image, reference, properties
 
     def run_task_case(
@@ -564,6 +633,8 @@ class TaskAwarePreprocessor:
                 task_mode=task_mode,
                 run_stage=run_stage,
                 reference_type="segmentation",
+                patch_sampling_image=properties.pop("__patch_sampling_image", None),
+                patch_sampling_target=properties.pop("__patch_sampling_target", None),
             )
 
         if task_mode == TaskMode.SEGMENTATION and run_stage == RunStage.PREDICT:
@@ -580,6 +651,7 @@ class TaskAwarePreprocessor:
                 task_mode=task_mode,
                 run_stage=run_stage,
                 reference_type="none",
+                patch_sampling_image=properties.pop("__patch_sampling_image", None),
             )
 
         if task_mode == TaskMode.SEGMENTATION and run_stage == RunStage.PREDICT_AND_EVALUATE:
@@ -598,6 +670,7 @@ class TaskAwarePreprocessor:
                 task_mode=task_mode,
                 run_stage=run_stage,
                 reference_type="segmentation",
+                patch_sampling_image=properties.pop("__patch_sampling_image", None),
             )
 
         if task_mode == TaskMode.PAIRED_GENERATIVE and run_stage == RunStage.TRAIN:
@@ -618,6 +691,8 @@ class TaskAwarePreprocessor:
                 task_mode=task_mode,
                 run_stage=run_stage,
                 reference_type="image",
+                patch_sampling_image=properties.pop("__patch_sampling_image", None),
+                patch_sampling_target=properties.pop("__patch_sampling_target", None),
             )
 
         image_pp, _, properties = self.generative_preprocessor.run_case(
@@ -633,6 +708,7 @@ class TaskAwarePreprocessor:
             task_mode=task_mode,
             run_stage=run_stage,
             reference_type="none",
+            patch_sampling_image=properties.pop("__patch_sampling_image", None),
         )
         if run_stage == RunStage.PREDICT_AND_EVALUATE:
             case.evaluation_reference = reference

@@ -210,6 +210,11 @@ def save_preprocessed_case(
     *,
     storage_format: str = DEFAULT_STORAGE_FORMAT,
     patch_size_hint: Optional[Sequence[int]] = None,
+    patch_sampling_patch_sizes: Optional[Dict[str, Sequence[int]]] = None,
+    patch_sampling_threshold: Optional[float] = None,
+    patch_sampling_min_fraction: float = 0.0,
+    patch_sampling_source: str = "image",
+    patch_sampling_max_starts: int = 8192,
 ) -> None:
     if not isinstance(case, TaskPreprocessedCase):
         _fail_validation(f"case must be a TaskPreprocessedCase, got {type(case).__name__}")
@@ -263,6 +268,14 @@ def save_preprocessed_case(
         "run_stage": case.run_stage,
         "reference_type": case.reference_type,
         "storage_format": storage_format,
+        "patch_sampling": _build_patch_sampling_metadata(
+            case,
+            patch_sizes=patch_sampling_patch_sizes,
+            threshold=patch_sampling_threshold,
+            min_fraction=patch_sampling_min_fraction,
+            source=patch_sampling_source,
+            max_starts=patch_sampling_max_starts,
+        ),
     }
     with open(output_filename_truncated + ".pkl", "wb") as f:
         pickle.dump(metadata, f)
@@ -712,6 +725,172 @@ def _crop_with_starts(array: np.ndarray, patch_size: Sequence[int], starts: Sequ
     return _squeeze_2d_patch_if_needed(_crop_spatial(array, target, starts), patch_size)
 
 
+def _patch_key(patch_size: Sequence[int]) -> str:
+    return "x".join(str(int(i)) for i in patch_size)
+
+
+def _integral_sum_nd(integral: np.ndarray, starts: Sequence[int], patch_size: Sequence[int]) -> int:
+    dims = len(patch_size)
+    ends = [int(s) + int(p) - 1 for s, p in zip(starts, patch_size)]
+    total = 0.0
+    for mask_bits in range(1 << dims):
+        index = []
+        sign = 1
+        for axis in range(dims):
+            if mask_bits & (1 << axis):
+                index.append(int(starts[axis]) - 1)
+                sign *= -1
+            else:
+                index.append(int(ends[axis]))
+        if all(i >= 0 for i in index):
+            total += sign * float(integral[tuple(index)])
+    return int(total)
+
+
+def _compute_patch_sampling_starts(
+    source: np.ndarray,
+    patch_size: Sequence[int],
+    *,
+    threshold: float,
+    min_fraction: float,
+    max_starts: int = 8192,
+) -> list[list[int]]:
+    if source.ndim >= 4:
+        foreground = np.any(source > threshold, axis=0)
+    else:
+        foreground = source > threshold
+    if not np.any(foreground):
+        return []
+    dummy = np.zeros((1, *foreground.shape), dtype=np.uint8)
+    target = _resolve_patch_size(dummy, patch_size, "patch sampling")
+    if target is None:
+        return []
+    target = tuple(int(i) for i in target)
+    spatial_shape = tuple(int(i) for i in foreground.shape)
+    if len(spatial_shape) != len(target):
+        return []
+    max_starts_per_axis = [max(dim - size, 0) for dim, size in zip(spatial_shape, target)]
+    strides = [max(1, size // 4) for size in target]
+    axes = [list(range(0, max_start + 1, stride)) for max_start, stride in zip(max_starts_per_axis, strides)]
+    for axis, max_start in enumerate(max_starts_per_axis):
+        if axes[axis][-1] != max_start:
+            axes[axis].append(max_start)
+    integral = foreground.astype(np.int32)
+    for axis in range(integral.ndim):
+        integral = integral.cumsum(axis=axis)
+    min_count = float(np.prod(target)) * float(min_fraction)
+    valid_starts: list[list[int]] = []
+    for starts_idx in np.ndindex(*(len(values) for values in axes)):
+        starts = tuple(axes[axis][idx] for axis, idx in enumerate(starts_idx))
+        if _integral_sum_nd(integral, starts, target) >= min_count:
+            valid_starts.append([int(i) for i in starts])
+            if len(valid_starts) >= int(max_starts):
+                break
+    return valid_starts
+
+
+def _build_patch_sampling_metadata(
+    case: TaskPreprocessedCase,
+    *,
+    patch_sizes: Optional[Dict[str, Sequence[int]]],
+    threshold: Optional[float],
+    min_fraction: float,
+    source: str,
+    max_starts: int,
+) -> Optional[dict]:
+    if threshold is None or patch_sizes is None or len(patch_sizes) == 0 or min_fraction <= 0:
+        return None
+    sampling_source = str(source).lower()
+    if sampling_source not in {"image", "target"}:
+        _fail_validation("patch sampling source must be either 'image' or 'target'")
+    sampling_array = case.patch_sampling_image if sampling_source == "image" else case.patch_sampling_target
+    if sampling_array is None:
+        sampling_array = case.image if sampling_source == "image" else case.target
+    if sampling_array is None:
+        return None
+    entries: Dict[str, dict] = {}
+    for name, patch_size in patch_sizes.items():
+        starts = _compute_patch_sampling_starts(
+            np.asarray(sampling_array),
+            patch_size,
+            threshold=float(threshold),
+            min_fraction=float(min_fraction),
+            max_starts=int(max_starts),
+        )
+        if starts:
+            entries[str(name)] = {
+                "patch_size": [int(i) for i in patch_size],
+                "starts": starts,
+            }
+    if not entries:
+        return None
+    return {
+        "source": sampling_source,
+        "threshold": float(threshold),
+        "min_fraction": float(min_fraction),
+        "max_starts": int(max_starts),
+        "entries": entries,
+    }
+
+
+def _sample_starts_from_precomputed(case: dict, patch_size: Sequence[int], rng: np.random.RandomState) -> Optional[Tuple[int, ...]]:
+    patch_sampling = case.get("patch_sampling")
+    if not isinstance(patch_sampling, dict):
+        return None
+    entries = patch_sampling.get("entries")
+    if not isinstance(entries, dict):
+        return None
+    entry = entries.get(_patch_key(patch_size))
+    if not isinstance(entry, dict):
+        return None
+    starts = entry.get("starts")
+    if not isinstance(starts, list) or len(starts) == 0:
+        return None
+    picked = starts[int(rng.randint(0, len(starts)))]
+    return tuple(int(i) for i in picked)
+
+
+def _foreground_fraction_in_patch(
+    array: np.ndarray,
+    patch_size: Sequence[int],
+    starts: Sequence[int],
+    threshold: float,
+) -> float:
+    patch = np.asarray(_crop_with_starts(array, patch_size, starts))
+    if patch.ndim <= 1:
+        return float(np.mean(patch > threshold))
+    if patch.ndim >= 3:
+        foreground = np.any(patch > threshold, axis=0)
+    else:
+        foreground = patch > threshold
+    return float(np.mean(foreground))
+
+
+def _compute_crop_starts_with_threshold(
+    array: np.ndarray,
+    patch_size: Sequence[int],
+    rng: np.random.RandomState,
+    *,
+    threshold: Optional[float],
+    min_fraction: float,
+    max_tries: int,
+) -> Tuple[int, ...]:
+    starts = _compute_crop_starts(array.shape[1:], patch_size, rng)
+    if threshold is None or min_fraction <= 0:
+        return starts
+    best_starts = starts
+    best_fraction = -1.0
+    for _ in range(max(1, int(max_tries))):
+        starts = _compute_crop_starts(array.shape[1:], patch_size, rng)
+        fraction = _foreground_fraction_in_patch(array, patch_size, starts, float(threshold))
+        if fraction >= min_fraction:
+            return starts
+        if fraction > best_fraction:
+            best_fraction = fraction
+            best_starts = starts
+    return best_starts
+
+
 class TaskPreprocessedDataset(Dataset):
     def __init__(
         self,
@@ -721,6 +900,10 @@ class TaskPreprocessedDataset(Dataset):
         transform: Optional[Callable[[Dict], Dict]] = None,
         require_target: bool = False,
         seed: int = 1234,
+        patch_foreground_threshold: Optional[float] = None,
+        patch_foreground_min_fraction: float = 0.0,
+        patch_foreground_source: str = "image",
+        patch_foreground_max_tries: int = 32,
     ):
         _require_torch()
         self.folder = folder
@@ -733,6 +916,20 @@ class TaskPreprocessedDataset(Dataset):
         self.transform = transform
         self.require_target = require_target
         self.seed = int(seed)
+        self.patch_foreground_threshold = (
+            None if patch_foreground_threshold is None else float(patch_foreground_threshold)
+        )
+        self.patch_foreground_min_fraction = float(patch_foreground_min_fraction)
+        self.patch_foreground_source = str(patch_foreground_source).lower()
+        self.patch_foreground_max_tries = int(patch_foreground_max_tries)
+        if self.patch_foreground_source not in {"image", "target"}:
+            _fail_validation("patch_foreground_source must be either 'image' or 'target'")
+        if not (0.0 <= self.patch_foreground_min_fraction <= 1.0):
+            _fail_validation(
+                f"patch_foreground_min_fraction must be in [0, 1], got {self.patch_foreground_min_fraction}"
+            )
+        if self.patch_foreground_max_tries <= 0:
+            _fail_validation(f"patch_foreground_max_tries must be positive, got {self.patch_foreground_max_tries}")
 
     def __len__(self) -> int:
         return len(self.identifiers)
@@ -752,7 +949,23 @@ class TaskPreprocessedDataset(Dataset):
                     f"Case '{identifier}' has mismatched image/target shapes: "
                     f"{case['image'].shape[1:]} vs {case['target'].shape[1:]}"
                 )
-            starts = _compute_crop_starts(case["image"].shape[1:], self.patch_size, rng)
+            crop_reference = case["image"]
+            if self.patch_foreground_source == "target":
+                if case["target"] is None:
+                    _fail_validation(
+                        "patch_foreground_source='target' requires targets to be present for patch sampling"
+                    )
+                crop_reference = case["target"]
+            starts = _sample_starts_from_precomputed(case, self.patch_size, rng)
+            if starts is None:
+                starts = _compute_crop_starts_with_threshold(
+                    crop_reference,
+                    self.patch_size,
+                    rng,
+                    threshold=self.patch_foreground_threshold,
+                    min_fraction=self.patch_foreground_min_fraction,
+                    max_tries=self.patch_foreground_max_tries,
+                )
             image = _crop_with_starts(case["image"], self.patch_size, starts)
             target = _crop_with_starts(case["target"], self.patch_size, starts) if case["target"] is not None else None
         evaluation_reference = case.get("evaluation_reference")
@@ -860,9 +1073,23 @@ class UnpairedGenerativeDataset(Dataset):
         )
         case_a = load_preprocessed_case(self.folder_a, identifier_a)
         case_b = load_preprocessed_case(self.folder_b, identifier_b)
+        starts_a = _sample_starts_from_precomputed(case_a, self.patch_size, rng) if self.patch_size is not None else None
+        starts_b = _sample_starts_from_precomputed(case_b, self.patch_size, rng) if self.patch_size is not None else None
         sample = {
-            "image_a": torch.from_numpy(np.asarray(_crop_or_pad(case_a["image"], self.patch_size, rng))).float(),
-            "image_b": torch.from_numpy(np.asarray(_crop_or_pad(case_b["image"], self.patch_size, rng))).float(),
+            "image_a": torch.from_numpy(
+                np.asarray(
+                    _crop_with_starts(case_a["image"], self.patch_size, starts_a)
+                    if starts_a is not None
+                    else _crop_or_pad(case_a["image"], self.patch_size, rng)
+                )
+            ).float(),
+            "image_b": torch.from_numpy(
+                np.asarray(
+                    _crop_with_starts(case_b["image"], self.patch_size, starts_b)
+                    if starts_b is not None
+                    else _crop_or_pad(case_b["image"], self.patch_size, rng)
+                )
+            ).float(),
             "identifier_a": identifier_a,
             "identifier_b": identifier_b,
             "properties_a": case_a["properties"],
@@ -883,6 +1110,10 @@ def load_preprocessed_dataset(
     seed: int = 1234,
     random_pairing: Optional[bool] = None,
     view_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    patch_foreground_threshold: Optional[float] = None,
+    patch_foreground_min_fraction: float = 0.0,
+    patch_foreground_source: str = "image",
+    patch_foreground_max_tries: int = 32,
 ) -> Dataset:
     manifest = load_preprocessed_dataset_manifest(folder)
     if split is not None and split not in {"train", "val"}:
@@ -936,6 +1167,10 @@ def load_preprocessed_dataset(
         "patch_size": effective_patch_size,
         "transform": transform,
         "seed": seed,
+        "patch_foreground_threshold": patch_foreground_threshold,
+        "patch_foreground_min_fraction": patch_foreground_min_fraction,
+        "patch_foreground_source": patch_foreground_source,
+        "patch_foreground_max_tries": patch_foreground_max_tries,
     }
     if task_mode == TaskMode.SEGMENTATION:
         return SegmentationDataset(**common_kwargs) if run_stage == RunStage.TRAIN else TaskPreprocessedDataset(**common_kwargs)

@@ -330,6 +330,21 @@ def _resolve_default_configuration(configurations: Optional[dict]) -> Optional[s
     return next(iter(configurations.keys()))
 
 
+def _build_patch_sampling_patch_sizes(
+    default_patch_size: Optional[Sequence[int]],
+    configurations: Optional[dict],
+) -> Optional[dict[str, tuple[int, ...]]]:
+    patch_sizes: dict[str, tuple[int, ...]] = {}
+    if default_patch_size is not None:
+        patch_sizes["default"] = tuple(int(i) for i in default_patch_size)
+    if configurations:
+        for name, payload in configurations.items():
+            patch_size = payload.get("patch_size")
+            if patch_size is not None:
+                patch_sizes[str(name)] = tuple(int(i) for i in patch_size)
+    return patch_sizes or None
+
+
 def _merge_unpaired_configurations(configurations_a: Optional[dict], configurations_b: Optional[dict]) -> Optional[dict]:
     if not configurations_a and not configurations_b:
         return None
@@ -463,6 +478,11 @@ def _preprocess_case(
     reference_dataset_json: Optional[dict] = None,
     storage_format: str = "blosc2",
     patch_size_hint: Optional[Sequence[int]] = None,
+    patch_sampling_patch_sizes: Optional[dict[str, tuple[int, ...]]] = None,
+    patch_sampling_threshold: Optional[float] = None,
+    patch_sampling_min_fraction: float = 0.0,
+    patch_sampling_source: str = "image",
+    patch_sampling_max_starts: int = 8192,
 ) -> None:
     from .preprocessing import TaskAwarePreprocessor
 
@@ -489,6 +509,11 @@ def _preprocess_case(
         str(_prepare_output_prefix(output_folder, identifier)),
         storage_format=storage_format,
         patch_size_hint=patch_size_hint,
+        patch_sampling_patch_sizes=patch_sampling_patch_sizes,
+        patch_sampling_threshold=patch_sampling_threshold,
+        patch_sampling_min_fraction=patch_sampling_min_fraction,
+        patch_sampling_source=patch_sampling_source,
+        patch_sampling_max_starts=patch_sampling_max_starts,
     )
 
 
@@ -505,6 +530,7 @@ def _preprocess_segmentation_or_self_supervised(
     configurations: Optional[dict],
 ) -> str:
     images = _scan_image_dir(args.images_dir, "--images-dir", args.multi_image)
+    patch_sampling_patch_sizes = _build_patch_sampling_patch_sizes(default_patch_size, configurations)
     output_folder = Path(args.output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
 
@@ -524,6 +550,11 @@ def _preprocess_segmentation_or_self_supervised(
                 "run_stage": args.run_stage,
                 "storage_format": args.storage_format,
                 "patch_size_hint": default_patch_size,
+                "patch_sampling_patch_sizes": patch_sampling_patch_sizes,
+                "patch_sampling_threshold": args.patch_foreground_threshold,
+                "patch_sampling_min_fraction": args.patch_foreground_min_fraction,
+                "patch_sampling_source": args.patch_foreground_source,
+                "patch_sampling_max_starts": args.patch_foreground_max_starts,
             }
             for identifier in identifiers
         ]
@@ -565,6 +596,11 @@ def _preprocess_segmentation_or_self_supervised(
             "reference_dataset_json": dataset_json,
             "storage_format": args.storage_format,
             "patch_size_hint": default_patch_size,
+            "patch_sampling_patch_sizes": patch_sampling_patch_sizes,
+            "patch_sampling_threshold": args.patch_foreground_threshold,
+            "patch_sampling_min_fraction": args.patch_foreground_min_fraction,
+            "patch_sampling_source": args.patch_foreground_source,
+            "patch_sampling_max_starts": args.patch_foreground_max_starts,
         }
         for identifier in identifiers
     ]
@@ -595,6 +631,7 @@ def _preprocess_paired(
     if args.source_dir is None:
         raise ValueError("paired_generative requires --source-dir")
     sources = _scan_image_dir(args.source_dir, "--source-dir", args.multi_image)
+    patch_sampling_patch_sizes = _build_patch_sampling_patch_sizes(default_patch_size, configurations)
     output_folder = Path(args.output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
 
@@ -625,6 +662,11 @@ def _preprocess_paired(
             "reference_dataset_json": dataset_json,
             "storage_format": args.storage_format,
             "patch_size_hint": default_patch_size,
+            "patch_sampling_patch_sizes": patch_sampling_patch_sizes,
+            "patch_sampling_threshold": args.patch_foreground_threshold,
+            "patch_sampling_min_fraction": args.patch_foreground_min_fraction,
+            "patch_sampling_source": args.patch_foreground_source,
+            "patch_sampling_max_starts": args.patch_foreground_max_starts,
         }
         for identifier in identifiers
     ]
@@ -668,6 +710,7 @@ def _preprocess_unpaired(
     folder_b = output_folder / args.folder_b_name
     folder_a.mkdir(exist_ok=True)
     folder_b.mkdir(exist_ok=True)
+    patch_sampling_patch_sizes = _build_patch_sampling_patch_sizes(default_patch_size, configurations)
 
     identifiers_a = sorted(domain_a.keys())
     identifiers_b = sorted(domain_b.keys())
@@ -683,6 +726,11 @@ def _preprocess_unpaired(
             "run_stage": args.run_stage,
             "storage_format": args.storage_format,
             "patch_size_hint": default_patch_size,
+            "patch_sampling_patch_sizes": patch_sampling_patch_sizes,
+            "patch_sampling_threshold": args.patch_foreground_threshold,
+            "patch_sampling_min_fraction": args.patch_foreground_min_fraction,
+            "patch_sampling_source": args.patch_foreground_source,
+            "patch_sampling_max_starts": args.patch_foreground_max_starts,
         }
         for identifier in identifiers_a
     ]
@@ -698,6 +746,11 @@ def _preprocess_unpaired(
             "run_stage": args.run_stage,
             "storage_format": args.storage_format,
             "patch_size_hint": default_patch_size,
+            "patch_sampling_patch_sizes": patch_sampling_patch_sizes,
+            "patch_sampling_threshold": args.patch_foreground_threshold,
+            "patch_sampling_min_fraction": args.patch_foreground_min_fraction,
+            "patch_sampling_source": args.patch_foreground_source,
+            "patch_sampling_max_starts": args.patch_foreground_max_starts,
         }
         for identifier in identifiers_b
     ]
@@ -909,7 +962,7 @@ def _build_config_argument_group(
     group = parser.add_argument_group(title)
     group.add_argument(
         json_flag,
-        default=None,
+        default=-900.0,
         help=f"{label}에 사용할 PreprocessingConfig JSON. 지정하면 자동 planning 대신 이 값을 사용",
     )
     group.add_argument(
@@ -1097,6 +1150,31 @@ def build_parser() -> argparse.ArgumentParser:
         configuration_flag="--configuration-b-name",
         label="domain B",
     )
+    preprocess_parser.add_argument(
+        "--patch-foreground-threshold",
+        type=float,
+        default=None,
+        help="threshold 기반 foreground mask를 만들어 valid patch 시작 위치를 미리 저장할 때 사용할 기준값",
+    )
+    preprocess_parser.add_argument(
+        "--patch-foreground-min-fraction",
+        type=float,
+        default=0.0,
+        help="저장할 patch 후보가 포함해야 하는 foreground 최소 비율 [0, 1]. 0이면 비활성화",
+    )
+    preprocess_parser.add_argument(
+        "--patch-foreground-source",
+        choices=("image", "target"),
+        default="image",
+        help="foreground mask를 만들 때 기준으로 사용할 배열",
+    )
+    preprocess_parser.add_argument(
+        "--patch-foreground-max-starts",
+        type=int,
+        default=8192,
+        help="patch size별로 metadata에 저장할 valid patch 시작 위치 최대 개수",
+    )
+
     preprocess_parser.set_defaults(func=_preprocess_dataset_command)
 
     save_parser = subparsers.add_parser(
