@@ -967,7 +967,7 @@ def _build_config_argument_group(
     )
     group.add_argument(
         plans_flag,
-        default=None,
+        default=-900.0,
         help=f"{label}에 사용할 nnU-Net plans JSON",
     )
     group.add_argument(
@@ -1153,8 +1153,8 @@ def build_parser() -> argparse.ArgumentParser:
     preprocess_parser.add_argument(
         "--patch-foreground-threshold",
         type=float,
-        default=None,
-        help="threshold 기반 foreground mask를 만들어 valid patch 시작 위치를 미리 저장할 때 사용할 기준값",
+        default=-900.0,
+        help="Foreground threshold in pre-normalization intensity space used to precompute valid patch starts.",
     )
     preprocess_parser.add_argument(
         "--patch-foreground-min-fraction",
