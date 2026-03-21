@@ -8,7 +8,7 @@ import numpy as np
 
 class ImageNormalization:
     leaves_pixels_outside_mask_at_zero_if_use_mask_for_norm_is_true = False
-    requires_intensity_properties = False
+    required_intensity_properties: tuple[str, ...] = ()
 
     def __init__(self, use_mask_for_norm: bool = False, intensity_properties: dict | None = None):
         self.use_mask_for_norm = bool(use_mask_for_norm)
@@ -37,18 +37,40 @@ class ZScoreNormalization(ImageNormalization):
 
 
 class CTNormalization(ImageNormalization):
-    requires_intensity_properties = True
+    required_intensity_properties = ("percentile_00_5", "percentile_99_5", "mean", "std")
 
     def run(self, image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
         image = image.astype(np.float32, copy=False)
         eps = 1e-8
-        lower = self.intensity_properties["percentile_00_5"]
-        upper = self.intensity_properties["percentile_99_5"]
+        lower = self.intensity_properties.get("clip_min", self.intensity_properties["percentile_00_5"])
+        upper = self.intensity_properties.get("clip_max", self.intensity_properties["percentile_99_5"])
         mean = self.intensity_properties["mean"]
         std = self.intensity_properties["std"]
         np.clip(image, lower, upper, out=image)
         image -= mean
         image /= max(std, eps)
+        return image
+
+
+class MinMaxClipNormalization(ImageNormalization):
+    required_intensity_properties = ("clip_min", "clip_max")
+
+    def run(self, image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+        image = image.astype(np.float32, copy=False)
+        eps = 1e-8
+        lower = self.intensity_properties["clip_min"]
+        upper = self.intensity_properties["clip_max"]
+        if lower is None or upper is None:
+            _fail_validation("MinMaxClipNormalization requires non-null clip_min and clip_max")
+        lower = float(lower)
+        upper = float(upper)
+        if lower >= upper:
+            _fail_validation(
+                f"MinMaxClipNormalization requires clip_min < clip_max, got {lower} and {upper}"
+            )
+        np.clip(image, lower, upper, out=image)
+        image -= lower
+        image /= max(upper - lower, eps)
         return image
 
 
@@ -78,6 +100,9 @@ NORMALIZATION_REGISTRY: Dict[str, Type[ImageNormalization]] = {
     "zscorenormalization": ZScoreNormalization,
     "ctnormalization": CTNormalization,
     "ct": CTNormalization,
+    "minmaxclipnormalization": MinMaxClipNormalization,
+    "minmax_clip": MinMaxClipNormalization,
+    "minmaxclip": MinMaxClipNormalization,
     "nonormalization": NoNormalization,
     "nonorm": NoNormalization,
     "rescaleto01normalization": RescaleTo01Normalization,

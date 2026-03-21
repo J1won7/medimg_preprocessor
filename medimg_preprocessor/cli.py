@@ -94,6 +94,13 @@ SUPPORTED_SCAN_ENDINGS = (
 
 MULTI_IMAGE_PATTERN = re.compile(r"^(?P<identifier>.+_\d{4})_(?P<channel>\d{4})$")
 
+NORMALIZATION_METHOD_CHOICES = (
+    "auto",
+    "CTNormalization",
+    "ZScoreNormalization",
+    "MinMaxClipNormalization",
+)
+
 
 def _log_stage(step: int, total_steps: int, title: str, detail: Optional[str] = None) -> None:
     message = f"[{step}/{total_steps}] {title}"
@@ -301,12 +308,65 @@ def _discover_dataset_json(*directories: Optional[str]) -> Optional[dict]:
     return None
 
 
+def _get_channel_names_for_logging(dataset_json: Optional[dict], num_channels: int) -> list[str]:
+    if dataset_json is None:
+        return ["unknown"] * num_channels
+    if "channel_names" in dataset_json:
+        channel_names = dataset_json["channel_names"]
+    elif "modality" in dataset_json:
+        channel_names = dataset_json["modality"]
+    else:
+        return ["unknown"] * num_channels
+    if not isinstance(channel_names, dict):
+        return ["unknown"] * num_channels
+    ordered = []
+    for key in sorted(channel_names.keys(), key=lambda x: int(x) if str(x).isdigit() else str(x)):
+        ordered.append(str(channel_names[key]))
+    if len(ordered) != num_channels:
+        return ["unknown"] * num_channels
+    return ordered
+
+
+def _log_normalization_summary(
+    label: str,
+    config: Optional[PreprocessingConfig],
+    *,
+    dataset_json: Optional[dict],
+    normalization_method: str,
+) -> None:
+    if config is None:
+        return
+    channel_names = _get_channel_names_for_logging(dataset_json, len(config.normalization_schemes))
+    if normalization_method == "auto":
+        source = "auto"
+        if dataset_json is None:
+            source += " (dataset.json 없음, 기본값 z-score)"
+        else:
+            source += " (dataset.json channel_names/modality 기준)"
+    else:
+        source = f"manual override ({normalization_method})"
+
+    print(f"  normalization[{label}] {source}", flush=True)
+    for idx, scheme in enumerate(config.normalization_schemes):
+        parts = [f"ch{idx}", f"name={channel_names[idx]}", f"scheme={scheme}", f"use_mask={config.use_mask_for_norm[idx]}"]
+        stats = config.foreground_intensity_properties_per_channel.get(str(idx), {})
+        if scheme == "CTNormalization":
+            clip_min = stats.get("clip_min", stats.get("percentile_00_5"))
+            clip_max = stats.get("clip_max", stats.get("percentile_99_5"))
+            parts.append(f"clip=[{clip_min}, {clip_max}]")
+        elif scheme == "MinMaxClipNormalization":
+            parts.append(f"clip=[{stats.get('clip_min')}, {stats.get('clip_max')}]")
+        print("   - " + ", ".join(parts), flush=True)
+
+
 def _plan_config_from_cases(
     cases: dict[str, list[str]],
     reader_name: str,
     *,
     dataset_json: Optional[dict] = None,
     reference_cases: Optional[dict[str, str]] = None,
+    ct_clip_min: Optional[float] = None,
+    ct_clip_max: Optional[float] = None,
     num_processes: int = 1,
 ) -> tuple[PreprocessingConfig, dict]:
     first_identifier = sorted(cases.keys())[0]
@@ -316,7 +376,81 @@ def _plan_config_from_cases(
         reader,
         dataset_json=dataset_json,
         reference_cases=reference_cases,
+        ct_clip_min=ct_clip_min,
+        ct_clip_max=ct_clip_max,
         num_processes=num_processes,
+    )
+
+
+def _resolve_normalization_method(name: Optional[str]) -> Optional[str]:
+    if name is None:
+        return None
+    if name not in NORMALIZATION_METHOD_CHOICES:
+        valid = ", ".join(NORMALIZATION_METHOD_CHOICES)
+        raise ValueError(f"Unsupported --normalization-method '{name}'. Supported values: {valid}")
+    return None if name == "auto" else str(name)
+
+
+def _override_normalization_config(
+    config: Optional[PreprocessingConfig],
+    *,
+    method: Optional[str],
+    normalization_min: Optional[float],
+    normalization_max: Optional[float],
+) -> Optional[PreprocessingConfig]:
+    if config is None:
+        return None
+
+    canonical_method = _resolve_normalization_method(method)
+    if canonical_method is None:
+        if (normalization_min is None) != (normalization_max is None):
+            raise ValueError("Use both --normalization-min and --normalization-max together")
+        if normalization_min is not None:
+            raise ValueError(
+                "--normalization-min/--normalization-max require "
+                "--normalization-method MinMaxClipNormalization"
+            )
+        return config
+
+    if canonical_method == "MinMaxClipNormalization":
+        if (normalization_min is None) != (normalization_max is None):
+            raise ValueError("Use both --normalization-min and --normalization-max together")
+        if normalization_min is None:
+            raise ValueError(
+                "MinMaxClipNormalization requires both --normalization-min and --normalization-max"
+            )
+        if normalization_min >= normalization_max:
+            raise ValueError("--normalization-min must be smaller than --normalization-max")
+    elif normalization_min is not None or normalization_max is not None:
+        raise ValueError(
+            "--normalization-min/--normalization-max are only supported with "
+            "--normalization-method MinMaxClipNormalization"
+        )
+
+    num_channels = len(config.normalization_schemes)
+    use_mask_for_norm = (
+        tuple(bool(i) for i in config.use_mask_for_norm)
+        if canonical_method == "ZScoreNormalization"
+        else tuple(False for _ in range(num_channels))
+    )
+    intensity_properties = {
+        str(k): dict(v) for k, v in config.foreground_intensity_properties_per_channel.items()
+    }
+    if canonical_method == "MinMaxClipNormalization":
+        for channel_idx in range(num_channels):
+            channel_key = str(channel_idx)
+            channel_properties = dict(intensity_properties.get(channel_key, {}))
+            channel_properties["clip_min"] = float(normalization_min)
+            channel_properties["clip_max"] = float(normalization_max)
+            intensity_properties[channel_key] = channel_properties
+
+    return PreprocessingConfig(
+        spacing=config.spacing,
+        transpose_forward=config.transpose_forward,
+        normalization_schemes=tuple(canonical_method for _ in range(num_channels)),
+        use_mask_for_norm=use_mask_for_norm,
+        foreground_intensity_properties_per_channel=intensity_properties,
+        resampling=config.resampling,
     )
 
 
@@ -779,6 +913,11 @@ def _preprocess_unpaired(
 def _preprocess_dataset_command(args: argparse.Namespace) -> int:
     total_steps = 4
     _ensure_storage_runtime(args.storage_format)
+    if (args.ct_clip_min is None) != (args.ct_clip_max is None):
+        raise ValueError("Use both --ct-clip-min and --ct-clip-max together")
+    if args.ct_clip_min is not None and args.ct_clip_min >= args.ct_clip_max:
+        raise ValueError("--ct-clip-min must be smaller than --ct-clip-max")
+    _resolve_normalization_method(args.normalization_method)
     _log_stage(1, total_steps, "Scan dataset", f"task_mode={args.task_mode}")
     base_config = _load_config(args.config_json, args.plans_file, args.configuration_name)
     config_a = _load_config(args.config_a_json, args.plans_a_file, args.configuration_a_name)
@@ -801,6 +940,8 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                 domain_a,
                 args.domain_a_reader,
                 dataset_json=dataset_json_a,
+                ct_clip_min=args.ct_clip_min,
+                ct_clip_max=args.ct_clip_max,
                 num_processes=args.num_processes,
             )
             configurations_a = fingerprint_a.get("planning_configurations")
@@ -811,11 +952,37 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                 domain_b,
                 args.domain_b_reader,
                 dataset_json=dataset_json_b,
+                ct_clip_min=args.ct_clip_min,
+                ct_clip_max=args.ct_clip_max,
                 num_processes=args.num_processes,
             )
             configurations_b = fingerprint_b.get("planning_configurations")
         else:
             configurations_b = None
+        config_a = _override_normalization_config(
+            config_a,
+            method=args.normalization_method,
+            normalization_min=args.normalization_min,
+            normalization_max=args.normalization_max,
+        )
+        config_b = _override_normalization_config(
+            config_b,
+            method=args.normalization_method,
+            normalization_min=args.normalization_min,
+            normalization_max=args.normalization_max,
+        )
+        _log_normalization_summary(
+            "domain_a",
+            config_a,
+            dataset_json=dataset_json_a,
+            normalization_method=args.normalization_method,
+        )
+        _log_normalization_summary(
+            "domain_b",
+            config_b,
+            dataset_json=dataset_json_b,
+            normalization_method=args.normalization_method,
+        )
         configurations = _merge_unpaired_configurations(configurations_a, configurations_b)
         default_configuration = _resolve_default_configuration(configurations)
         if default_patch_size is None and default_configuration is not None:
@@ -858,12 +1025,26 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                     args.image_reader,
                     dataset_json=dataset_json,
                     reference_cases=labels,
+                    ct_clip_min=args.ct_clip_min,
+                    ct_clip_max=args.ct_clip_max,
                     num_processes=args.num_processes,
                 )
                 configurations = fingerprint.get("planning_configurations")
                 default_configuration = _resolve_default_configuration(configurations)
                 if default_patch_size is None and default_configuration is not None:
                     default_patch_size = tuple(configurations[default_configuration]["patch_size"])
+            base_config = _override_normalization_config(
+                base_config,
+                method=args.normalization_method,
+                normalization_min=args.normalization_min,
+                normalization_max=args.normalization_max,
+            )
+            _log_normalization_summary(
+                "image",
+                base_config,
+                dataset_json=dataset_json,
+                normalization_method=args.normalization_method,
+            )
             _log_stage(3, total_steps, "Preprocess cases", "writing preprocessed case files")
             manifest_file = _preprocess_segmentation_or_self_supervised(
                 args,
@@ -896,12 +1077,26 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                     sources,
                     args.source_reader,
                     dataset_json=dataset_json,
+                    ct_clip_min=args.ct_clip_min,
+                    ct_clip_max=args.ct_clip_max,
                     num_processes=args.num_processes,
                 )
                 configurations = fingerprint.get("planning_configurations")
                 default_configuration = _resolve_default_configuration(configurations)
                 if default_patch_size is None and default_configuration is not None:
                     default_patch_size = tuple(configurations[default_configuration]["patch_size"])
+            base_config = _override_normalization_config(
+                base_config,
+                method=args.normalization_method,
+                normalization_min=args.normalization_min,
+                normalization_max=args.normalization_max,
+            )
+            _log_normalization_summary(
+                "source",
+                base_config,
+                dataset_json=dataset_json,
+                normalization_method=args.normalization_method,
+            )
             _log_stage(3, total_steps, "Preprocess cases", "writing preprocessed case files")
             manifest_file = _preprocess_paired(
                 args,
@@ -1175,6 +1370,40 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=8192,
         help="Maximum number of valid patch start locations to store per patch size.",
+    )
+    preprocess_parser.add_argument(
+        "--ct-clip-min",
+        type=float,
+        default=None,
+        help="Optional fixed lower HU/intensity clip for CT normalization. Default keeps percentile-based clipping.",
+    )
+    preprocess_parser.add_argument(
+        "--ct-clip-max",
+        type=float,
+        default=None,
+        help="Optional fixed upper HU/intensity clip for CT normalization. Default keeps percentile-based clipping.",
+    )
+    preprocess_parser.add_argument(
+        "--normalization-method",
+        default="auto",
+        choices=NORMALIZATION_METHOD_CHOICES,
+        help=(
+            "Override normalization for all image channels. "
+            "Supported values: auto, CTNormalization, "
+            "ZScoreNormalization, MinMaxClipNormalization."
+        ),
+    )
+    preprocess_parser.add_argument(
+        "--normalization-min",
+        type=float,
+        default=None,
+        help="Lower bound used by MinMaxClipNormalization. Requires --normalization-method MinMaxClipNormalization.",
+    )
+    preprocess_parser.add_argument(
+        "--normalization-max",
+        type=float,
+        default=None,
+        help="Upper bound used by MinMaxClipNormalization. Requires --normalization-method MinMaxClipNormalization.",
     )
 
     preprocess_parser.set_defaults(func=_preprocess_dataset_command)

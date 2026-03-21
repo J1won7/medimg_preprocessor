@@ -70,6 +70,19 @@ def _fail_validation(message: str) -> None:
     raise ValueError(message)
 
 
+def _clip_values(
+    values: np.ndarray,
+    *,
+    clip_min: Optional[float] = None,
+    clip_max: Optional[float] = None,
+) -> np.ndarray:
+    if clip_min is None and clip_max is None:
+        return values
+    lower = -np.inf if clip_min is None else float(clip_min)
+    upper = np.inf if clip_max is None else float(clip_max)
+    return np.clip(values, lower, upper)
+
+
 def _resolve_settings(settings: Optional[ModularPreprocessingSettings], mode: str) -> ModularPreprocessingSettings:
     if settings is None:
         return (
@@ -184,8 +197,8 @@ class ModularPreprocessor:
             scheme = self.config.normalization_schemes[c]
             normalizer_cls = get_normalizer(scheme)
             channel_stats = stats.get(str(c), {})
-            if normalizer_cls.requires_intensity_properties:
-                required = {"percentile_00_5", "percentile_99_5", "mean", "std"}
+            required = set(getattr(normalizer_cls, "required_intensity_properties", ()))
+            if required:
                 missing = sorted(required.difference(channel_stats.keys()))
                 if missing:
                     _fail_validation(
@@ -791,6 +804,8 @@ def compute_intensity_properties_from_image(
     num_samples: int = 10000,
     seed: int = 1234,
     use_nonzero_mask: bool = True,
+    clip_min: Optional[float] = None,
+    clip_max: Optional[float] = None,
 ) -> dict:
     if not isinstance(image, np.ndarray):
         _fail_validation(f"image must be a numpy.ndarray, got {type(image).__name__}")
@@ -806,6 +821,7 @@ def compute_intensity_properties_from_image(
         values = image[c][mask]
         if values.size == 0:
             values = image[c].ravel()
+        values = _clip_values(values, clip_min=clip_min, clip_max=clip_max)
         sampled = rng.choice(values, min(num_samples, values.size), replace=False)
         p005, median, p995 = np.percentile(sampled, percentiles)
         stats[str(c)] = {
@@ -816,6 +832,8 @@ def compute_intensity_properties_from_image(
             "max": float(sampled.max()),
             "percentile_99_5": float(p995),
             "percentile_00_5": float(p005),
+            "clip_min": None if clip_min is None else float(clip_min),
+            "clip_max": None if clip_max is None else float(clip_max),
         }
     return stats
 
@@ -825,6 +843,8 @@ def aggregate_intensity_properties_from_arrays(
     num_samples_per_case: int = 10000,
     seed: int = 1234,
     use_nonzero_mask: bool = True,
+    clip_min: Optional[float] = None,
+    clip_max: Optional[float] = None,
 ) -> dict:
     if len(images) == 0:
         _fail_validation("aggregate_intensity_properties_from_arrays requires at least one image")
@@ -842,6 +862,7 @@ def aggregate_intensity_properties_from_arrays(
             values = image[c][mask]
             if values.size == 0:
                 values = image[c].ravel()
+            values = _clip_values(values, clip_min=clip_min, clip_max=clip_max)
             per_channel.setdefault(c, []).append(
                 rng.choice(values, min(num_samples_per_case, values.size), replace=False)
             )
@@ -858,6 +879,8 @@ def aggregate_intensity_properties_from_arrays(
             "max": float(values.max()),
             "percentile_99_5": float(p995),
             "percentile_00_5": float(p005),
+            "clip_min": None if clip_min is None else float(clip_min),
+            "clip_max": None if clip_max is None else float(clip_max),
         }
     return result
 
@@ -868,6 +891,8 @@ def aggregate_intensity_properties_from_image_files(
     num_samples_per_case: int = 10000,
     seed: int = 1234,
     use_nonzero_mask: bool = True,
+    clip_min: Optional[float] = None,
+    clip_max: Optional[float] = None,
 ) -> dict:
     if not callable(reader_fn):
         _fail_validation("reader_fn must be callable")
@@ -879,4 +904,6 @@ def aggregate_intensity_properties_from_image_files(
         num_samples_per_case=num_samples_per_case,
         seed=seed,
         use_nonzero_mask=use_nonzero_mask,
+        clip_min=clip_min,
+        clip_max=clip_max,
     )

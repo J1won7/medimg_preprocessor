@@ -155,7 +155,7 @@ class PreprocessingConfig:
         if transpose_forward is None:
             transpose_forward = tuple(range(dims))
         if normalization_schemes is None:
-            normalization_schemes = tuple("zscore" for _ in range(num_channels))
+            normalization_schemes = tuple("ZScoreNormalization" for _ in range(num_channels))
         if use_mask_for_norm is None:
             use_mask_for_norm = tuple(False for _ in range(num_channels))
         if foreground_intensity_properties_per_channel is None:

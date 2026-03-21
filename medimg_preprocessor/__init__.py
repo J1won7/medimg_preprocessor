@@ -1,5 +1,13 @@
 from .cli import medimg_preprocess
 from .config import PreprocessingConfig, ResamplingConfig
+from .normalization import (
+    CTNormalization,
+    MinMaxClipNormalization,
+    NoNormalization,
+    RescaleTo01Normalization,
+    RGBTo01Normalization,
+    ZScoreNormalization,
+)
 from .preprocessing import (
     GenerativePreprocessor,
     ModularPreprocessingSettings,
@@ -67,12 +75,18 @@ __all__ = [
     "medimg_preprocess",
     "PreprocessingConfig",
     "ResamplingConfig",
+    "CTNormalization",
+    "MinMaxClipNormalization",
+    "NoNormalization",
     "PreprocessingMode",
+    "RescaleTo01Normalization",
+    "RGBTo01Normalization",
     "RunStage",
     "SegmentationPreprocessor",
     "TaskAwarePreprocessor",
     "TaskMode",
     "TaskPreprocessedCase",
+    "ZScoreNormalization",
     "aggregate_intensity_properties_from_arrays",
     "aggregate_intensity_properties_from_image_files",
     "compute_intensity_properties_from_image",

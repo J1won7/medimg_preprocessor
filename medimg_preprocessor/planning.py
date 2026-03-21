@@ -37,6 +37,19 @@ _CHANNEL_NAME_TO_NORMALIZATION = {
 }
 
 
+def _clip_values(
+    values: np.ndarray,
+    *,
+    clip_min: Optional[float] = None,
+    clip_max: Optional[float] = None,
+) -> np.ndarray:
+    if clip_min is None and clip_max is None:
+        return values
+    lower = -np.inf if clip_min is None else float(clip_min)
+    upper = np.inf if clip_max is None else float(clip_max)
+    return np.clip(values, lower, upper)
+
+
 @dataclass(frozen=True)
 class PlanningConfiguration:
     name: str
@@ -358,7 +371,10 @@ def extract_fingerprint_from_cases(
     reader,
     *,
     reference_cases: Optional[dict[str, Sequence[str] | str]] = None,
+    dataset_json: Optional[dict] = None,
     num_foreground_samples_total: int = int(10e7),
+    ct_clip_min: Optional[float] = None,
+    ct_clip_max: Optional[float] = None,
     num_processes: int = 1,
 ) -> dict:
     if len(cases) == 0:
@@ -385,11 +401,14 @@ def extract_fingerprint_from_cases(
     spacings = [r[1] for r in results]
     num_channels = len(results[0][2])
     stacked_intensities = [np.concatenate([r[2][i] for r in results]) for i in range(num_channels)]
+    channel_names = _get_channel_names(dataset_json, num_channels)
 
     percentiles = np.array((0.5, 50.0, 99.5))
     intensity_statistics_per_channel: Dict[int, dict] = {}
     for i in range(num_channels):
         values = stacked_intensities[i]
+        if _CHANNEL_NAME_TO_NORMALIZATION.get(channel_names[i].casefold(), ZScoreNormalization) is CTNormalization:
+            values = _clip_values(values, clip_min=ct_clip_min, clip_max=ct_clip_max)
         if values.size == 0:
             intensity_statistics_per_channel[i] = {
                 "mean": float("nan"),
@@ -399,6 +418,8 @@ def extract_fingerprint_from_cases(
                 "max": float("nan"),
                 "percentile_99_5": float("nan"),
                 "percentile_00_5": float("nan"),
+                "clip_min": None,
+                "clip_max": None,
             }
             continue
         percentile_00_5, median, percentile_99_5 = np.percentile(values, percentiles)
@@ -410,6 +431,8 @@ def extract_fingerprint_from_cases(
             "max": float(np.max(values)),
             "percentile_99_5": float(percentile_99_5),
             "percentile_00_5": float(percentile_00_5),
+            "clip_min": None if ct_clip_min is None else float(ct_clip_min),
+            "clip_max": None if ct_clip_max is None else float(ct_clip_max),
         }
 
     return {
@@ -548,12 +571,17 @@ def plan_preprocessing_from_cases(
     reference_cases: Optional[dict[str, Sequence[str] | str]] = None,
     suppress_transpose: bool = False,
     overwrite_target_spacing: Optional[Sequence[float]] = None,
+    ct_clip_min: Optional[float] = None,
+    ct_clip_max: Optional[float] = None,
     num_processes: int = 1,
 ) -> tuple[PreprocessingConfig, dict]:
     fingerprint = extract_fingerprint_from_cases(
         cases,
         reader,
         reference_cases=reference_cases,
+        dataset_json=dataset_json,
+        ct_clip_min=ct_clip_min,
+        ct_clip_max=ct_clip_max,
         num_processes=num_processes,
     )
     first_identifier = sorted(cases.keys())[0]

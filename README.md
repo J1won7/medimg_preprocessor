@@ -129,6 +129,48 @@ python -m medimg_preprocessor preprocess-dataset \
   --output-folder preprocessed_ssl
 ```
 
+## 정규화 방식 직접 지정
+
+`preprocess-dataset` 실행 시 자동 planning 대신 아래 3가지 정규화 방식 중 하나를 강제로 적용할 수 있습니다.
+
+- `--normalization-method CTNormalization`
+  - nnU-Net의 CT 정규화와 같은 방식입니다.
+  - 각 채널에 대해 dataset-level 통계를 사용합니다.
+  - 먼저 clip을 적용한 뒤 `mean/std`로 정규화합니다.
+  - 현재 구현에서는 `clip_min/clip_max`가 있으면 그 값을 쓰고, 없으면 `percentile_00_5/percentile_99_5`를 사용합니다.
+
+- `--normalization-method ZScoreNormalization`
+  - 각 이미지 채널별로 z-score 정규화를 적용합니다.
+  - 즉 `mean`을 빼고 `std`로 나눕니다.
+  - mask 기반 정규화가 설정되어 있으면 nonzero 영역 또는 reference mask 기준으로 계산합니다.
+
+- `--normalization-method MinMaxClipNormalization`
+  - 사용자가 지정한 `min/max` 범위로 먼저 clip합니다.
+  - 그 다음 `[0, 1]` 범위로 선형 스케일링합니다.
+  - 이 모드를 사용할 때는 반드시 `--normalization-min`, `--normalization-max`를 함께 지정해야 합니다.
+
+예시:
+
+```bash
+python -m medimg_preprocessor preprocess-dataset \
+  --task-mode paired_generative \
+  --source-dir source \
+  --target-dir target \
+  --output-folder preprocessed_paired \
+  --normalization-method ZScoreNormalization
+```
+
+```bash
+python -m medimg_preprocessor preprocess-dataset \
+  --task-mode paired_generative \
+  --source-dir source \
+  --target-dir target \
+  --output-folder preprocessed_paired \
+  --normalization-method MinMaxClipNormalization \
+  --normalization-min -1000 \
+  --normalization-max 2000
+```
+
 ## 디렉토리 규칙
 
 ### Segmentation
