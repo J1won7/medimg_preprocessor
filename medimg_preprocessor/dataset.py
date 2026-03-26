@@ -15,12 +15,15 @@ except ModuleNotFoundError:
     blosc2 = None
 try:
     import torch
-    from torch.utils.data import Dataset
+    from torch.utils.data import Dataset, get_worker_info
 except ModuleNotFoundError:
     torch = None
 
     class Dataset:
         pass
+
+    def get_worker_info():
+        return None
 
 from .config import PreprocessingConfig
 from .preprocessing import RunStage, TaskMode, TaskPreprocessedCase
@@ -28,6 +31,7 @@ from .preprocessing import RunStage, TaskMode, TaskPreprocessedCase
 
 MANIFEST_FILENAME = "preprocessing_manifest.json"
 DEFAULT_STORAGE_FORMAT = "blosc2"
+DEFAULT_MASK_LOCATION_SAMPLES = 10000
 
 
 def _fail_validation(message: str) -> None:
@@ -136,6 +140,17 @@ def _read_json(filename: str) -> dict:
     return payload
 
 
+def _sample_mask_locations(mask: np.ndarray, *, seed: int = 1234, max_samples: int = DEFAULT_MASK_LOCATION_SAMPLES) -> list[list[int]]:
+    mask = np.asarray(mask).astype(bool)
+    coords = np.argwhere(mask)
+    if len(coords) == 0:
+        return []
+    rng = np.random.RandomState(int(seed))
+    if len(coords) > int(max_samples):
+        coords = coords[rng.choice(len(coords), int(max_samples), replace=False)]
+    return [[int(i) for i in row] for row in coords]
+
+
 def _validate_storage_format(storage_format: str) -> str:
     storage_format = str(storage_format).lower()
     if storage_format not in {"blosc2", "npz"}:
@@ -238,6 +253,13 @@ def save_preprocessed_case(
             "case.evaluation_reference spatial shape must match image, "
             f"got {case.evaluation_reference.shape[1:]} and {case.image.shape[1:]}"
         )
+    stored_mask = case.mask if case.mask is not None else case.patch_sampling_mask
+    if stored_mask is not None:
+        stored_mask = np.asarray(stored_mask)
+        if tuple(stored_mask.shape) != tuple(case.image.shape[1:]):
+            _fail_validation(
+                f"case.mask spatial shape must match image, got {stored_mask.shape} and {case.image.shape[1:]}"
+            )
     storage_format = _validate_storage_format(storage_format)
     if storage_format == "npz":
         arrays = {"image": np.ascontiguousarray(case.image)}
@@ -245,6 +267,8 @@ def save_preprocessed_case(
             arrays["target"] = np.ascontiguousarray(case.target)
         if case.evaluation_reference is not None:
             arrays["evaluation_reference"] = np.ascontiguousarray(case.evaluation_reference)
+        if stored_mask is not None:
+            arrays["mask"] = np.ascontiguousarray(stored_mask.astype(np.uint8, copy=False))
         np.savez_compressed(output_filename_truncated + ".npz", **arrays)
     else:
         _save_blosc2_array(np.ascontiguousarray(case.image), output_filename_truncated + ".b2nd", patch_size_hint)
@@ -260,6 +284,12 @@ def save_preprocessed_case(
                 output_filename_truncated + "_evalref.b2nd",
                 patch_size_hint,
             )
+        if stored_mask is not None:
+            _save_blosc2_array(
+                np.ascontiguousarray(stored_mask[None].astype(np.uint8, copy=False)),
+                output_filename_truncated + "_mask.b2nd",
+                patch_size_hint,
+            )
     metadata = {
         "properties": case.properties,
         "target_properties": case.target_properties,
@@ -268,14 +298,13 @@ def save_preprocessed_case(
         "run_stage": case.run_stage,
         "reference_type": case.reference_type,
         "storage_format": storage_format,
-        "patch_sampling": _build_patch_sampling_metadata(
-            case,
-            patch_sizes=patch_sampling_patch_sizes,
-            threshold=patch_sampling_threshold,
-            min_fraction=patch_sampling_min_fraction,
-            source=patch_sampling_source,
-            max_starts=patch_sampling_max_starts,
-        ),
+        "mask_locations": _sample_mask_locations(
+            stored_mask,
+            max_samples=int(patch_sampling_max_starts),
+        )
+        if stored_mask is not None
+        else None,
+        "patch_sampling": None,
     }
     with open(output_filename_truncated + ".pkl", "wb") as f:
         pickle.dump(metadata, f)
@@ -551,6 +580,7 @@ def load_preprocessed_case(folder: str, identifier: str) -> dict:
     b2nd_image_file = os.path.join(folder, identifier + ".b2nd")
     b2nd_target_file = os.path.join(folder, identifier + "_target.b2nd")
     b2nd_eval_file = os.path.join(folder, identifier + "_evalref.b2nd")
+    b2nd_mask_file = os.path.join(folder, identifier + "_mask.b2nd")
     npz_file = os.path.join(folder, identifier + ".npz")
     pkl_file = os.path.join(folder, identifier + ".pkl")
     has_blosc2 = os.path.isfile(b2nd_image_file)
@@ -576,10 +606,12 @@ def load_preprocessed_case(folder: str, identifier: str) -> dict:
             if os.path.isfile(b2nd_eval_file)
             else None
         )
+        mask = blosc2.open(urlpath=b2nd_mask_file, mode="r", dparams=dparams, **mmap_kwargs) if os.path.isfile(b2nd_mask_file) else None
         case = {
             "image": image,
             "target": target,
             "evaluation_reference": evaluation_reference,
+            "mask": None if mask is None else mask[0],
             **meta,
         }
     else:
@@ -592,6 +624,7 @@ def load_preprocessed_case(folder: str, identifier: str) -> dict:
                 "evaluation_reference": arrays["evaluation_reference"]
                 if "evaluation_reference" in arrays.files
                 else None,
+                "mask": arrays["mask"] if "mask" in arrays.files else None,
                 **meta,
             }
     if "properties" not in case or not isinstance(case["properties"], dict):
@@ -609,6 +642,13 @@ def load_preprocessed_case(folder: str, identifier: str) -> dict:
             f"Preprocessed case '{identifier}' has mismatched image/evaluation_reference shapes: "
             f"{case['image'].shape[1:]} vs {case['evaluation_reference'].shape[1:]}"
         )
+    if case.get("mask") is not None and tuple(case["mask"].shape) != tuple(case["image"].shape[1:]):
+        _fail_validation(
+            f"Preprocessed case '{identifier}' has mismatched image/mask shapes: "
+            f"{case['image'].shape[1:]} vs {case['mask'].shape}"
+        )
+    if case.get("mask_locations") is None and case.get("mask") is not None:
+        case["mask_locations"] = _sample_mask_locations(np.asarray(case["mask"]))
     return case
 
 
@@ -619,7 +659,12 @@ def _list_identifiers(folder: str) -> list[str]:
     for name in os.listdir(folder):
         if name.endswith(".npz"):
             identifiers.add(os.path.splitext(name)[0])
-        elif name.endswith(".b2nd") and not name.endswith("_target.b2nd") and not name.endswith("_evalref.b2nd"):
+        elif (
+            name.endswith(".b2nd")
+            and not name.endswith("_target.b2nd")
+            and not name.endswith("_evalref.b2nd")
+            and not name.endswith("_mask.b2nd")
+        ):
             identifiers.add(name[:-5])
     return sorted(identifiers)
 
@@ -651,6 +696,15 @@ def _resolve_patch_size(array: np.ndarray, patch_size: Optional[Sequence[int]], 
         f"{context} expects patch_size with {spatial_dims} spatial dims, got {len(patch_size)} "
         f"for array shape {array.shape}"
     )
+
+
+def _build_runtime_rng(seed: int, index: int) -> np.random.RandomState:
+    base = int(seed) + int(index) * 1009
+    worker_info = get_worker_info()
+    if worker_info is not None:
+        base += int(worker_info.id) * 104729
+    base += int(np.random.randint(0, np.iinfo(np.int32).max))
+    return np.random.RandomState(base % np.iinfo(np.int32).max)
 
 
 def _crop_spatial(array: np.ndarray, target: Sequence[int], starts: Sequence[int]) -> np.ndarray:
@@ -790,6 +844,47 @@ def _compute_patch_sampling_starts(
     return valid_starts
 
 
+def _compute_patch_sampling_starts_from_mask(
+    foreground: np.ndarray,
+    patch_size: Sequence[int],
+    *,
+    min_fraction: float,
+    max_starts: int = 8192,
+) -> list[list[int]]:
+    foreground = np.asarray(foreground).astype(bool)
+    if foreground.ndim >= 4:
+        foreground = np.any(foreground, axis=0)
+    if not np.any(foreground):
+        return []
+    dummy = np.zeros((1, *foreground.shape), dtype=np.uint8)
+    target = _resolve_patch_size(dummy, patch_size, "patch sampling")
+    if target is None:
+        return []
+    target = tuple(int(i) for i in target)
+    spatial_shape = tuple(int(i) for i in foreground.shape)
+    if len(spatial_shape) != len(target):
+        return []
+    max_starts_per_axis = [max(dim - size, 0) for dim, size in zip(spatial_shape, target)]
+    strides = [max(1, size // 4) for size in target]
+    axes = [list(range(0, max_start + 1, stride)) for max_start, stride in zip(max_starts_per_axis, strides)]
+    for axis, max_start in enumerate(max_starts_per_axis):
+        if axes[axis][-1] != max_start:
+            axes[axis].append(max_start)
+    integral = foreground.astype(np.int32)
+    for axis in range(integral.ndim):
+        integral = integral.cumsum(axis=axis)
+    effective_patch_voxels = float(np.prod([min(dim, size) for dim, size in zip(spatial_shape, target)]))
+    min_count = effective_patch_voxels * float(min_fraction)
+    valid_starts: list[list[int]] = []
+    for starts_idx in np.ndindex(*(len(values) for values in axes)):
+        starts = tuple(axes[axis][idx] for axis, idx in enumerate(starts_idx))
+        if _integral_sum_nd(integral, starts, target) >= min_count:
+            valid_starts.append([int(i) for i in starts])
+            if len(valid_starts) >= int(max_starts):
+                break
+    return valid_starts
+
+
 def _build_patch_sampling_metadata(
     case: TaskPreprocessedCase,
     *,
@@ -799,25 +894,40 @@ def _build_patch_sampling_metadata(
     source: str,
     max_starts: int,
 ) -> Optional[dict]:
-    if threshold is None or patch_sizes is None or len(patch_sizes) == 0 or min_fraction <= 0:
+    if patch_sizes is None or len(patch_sizes) == 0 or min_fraction <= 0:
         return None
-    sampling_source = str(source).lower()
-    if sampling_source not in {"image", "target"}:
-        _fail_validation("patch sampling source must be either 'image' or 'target'")
-    sampling_array = case.patch_sampling_image if sampling_source == "image" else case.patch_sampling_target
-    if sampling_array is None:
-        sampling_array = case.image if sampling_source == "image" else case.target
-    if sampling_array is None:
-        return None
+    sampling_mask = case.patch_sampling_mask
+    metadata_mode = "mask" if sampling_mask is not None else "threshold"
+    sampling_source = "preprocessing_mask"
+    sampling_array = None
+    if sampling_mask is None:
+        if threshold is None:
+            return None
+        sampling_source = str(source).lower()
+        if sampling_source not in {"image", "target"}:
+            _fail_validation("patch sampling source must be either 'image' or 'target'")
+        sampling_array = case.patch_sampling_image if sampling_source == "image" else case.patch_sampling_target
+        if sampling_array is None:
+            sampling_array = case.image if sampling_source == "image" else case.target
+        if sampling_array is None:
+            return None
     entries: Dict[str, dict] = {}
     for name, patch_size in patch_sizes.items():
-        starts = _compute_patch_sampling_starts(
-            np.asarray(sampling_array),
-            patch_size,
-            threshold=float(threshold),
-            min_fraction=float(min_fraction),
-            max_starts=int(max_starts),
-        )
+        if sampling_mask is not None:
+            starts = _compute_patch_sampling_starts_from_mask(
+                np.asarray(sampling_mask),
+                patch_size,
+                min_fraction=float(min_fraction),
+                max_starts=int(max_starts),
+            )
+        else:
+            starts = _compute_patch_sampling_starts(
+                np.asarray(sampling_array),
+                patch_size,
+                threshold=float(threshold),
+                min_fraction=float(min_fraction),
+                max_starts=int(max_starts),
+            )
         if starts:
             entries[str(name)] = {
                 "patch_size": [int(i) for i in patch_size],
@@ -826,8 +936,9 @@ def _build_patch_sampling_metadata(
     if not entries:
         return None
     return {
+        "mode": metadata_mode,
         "source": sampling_source,
-        "threshold": float(threshold),
+        "threshold": None if threshold is None else float(threshold),
         "min_fraction": float(min_fraction),
         "max_starts": int(max_starts),
         "entries": entries,
@@ -849,6 +960,70 @@ def _sample_starts_from_precomputed(case: dict, patch_size: Sequence[int], rng: 
         return None
     picked = starts[int(rng.randint(0, len(starts)))]
     return tuple(int(i) for i in picked)
+
+
+def _normalize_location_samples(locations: Any) -> list[tuple[int, ...]]:
+    if locations is None:
+        return []
+    if isinstance(locations, np.ndarray):
+        iterable = locations.tolist()
+    elif isinstance(locations, list):
+        iterable = locations
+    else:
+        return []
+    normalized: list[tuple[int, ...]] = []
+    for row in iterable:
+        if isinstance(row, np.ndarray):
+            row = row.tolist()
+        if not isinstance(row, (list, tuple)) or len(row) == 0:
+            continue
+        normalized.append(tuple(int(i) for i in row))
+    return normalized
+
+
+def _gather_sampling_locations(case: dict) -> list[tuple[int, ...]]:
+    properties = case.get("properties")
+    if isinstance(properties, dict):
+        class_locations = properties.get("class_locations")
+        if isinstance(class_locations, dict):
+            pooled: list[tuple[int, ...]] = []
+            for values in class_locations.values():
+                pooled.extend(_normalize_location_samples(values))
+            if pooled:
+                return pooled
+    return _normalize_location_samples(case.get("mask_locations"))
+
+
+def _sample_starts_from_locations(
+    case: dict,
+    patch_size: Sequence[int],
+    rng: np.random.RandomState,
+) -> Optional[Tuple[int, ...]]:
+    locations = _gather_sampling_locations(case)
+    if len(locations) == 0:
+        return None
+    patch_array = np.zeros((1, *case["image"].shape[1:]), dtype=np.uint8)
+    target = _resolve_patch_size(patch_array, patch_size, "location sampling")
+    if target is None:
+        return None
+    spatial_shape = tuple(int(i) for i in case["image"].shape[1:])
+    picked = locations[int(rng.randint(0, len(locations)))]
+    spatial_location = picked[-len(target):]
+    starts: list[int] = []
+    for axis, (shape_dim, patch_dim, center) in enumerate(zip(spatial_shape, target, spatial_location)):
+        shape_dim = int(shape_dim)
+        patch_dim = int(patch_dim)
+        center = int(center)
+        if shape_dim <= patch_dim:
+            starts.append(0)
+            continue
+        lower_bound = max(0, center - patch_dim + 1)
+        upper_bound = min(center, shape_dim - patch_dim)
+        if upper_bound < lower_bound:
+            starts.append(max(0, min(shape_dim - patch_dim, center - patch_dim // 2)))
+            continue
+        starts.append(int(rng.randint(lower_bound, upper_bound + 1)))
+    return tuple(starts)
 
 
 def _foreground_fraction_in_patch(
@@ -940,7 +1115,7 @@ class TaskPreprocessedDataset(Dataset):
         case = load_preprocessed_case(self.folder, identifier)
         if self.require_target and case["target"] is None:
             _fail_validation(f"Case '{identifier}' does not have a target")
-        rng = np.random.RandomState(self.seed + index)
+        rng = _build_runtime_rng(self.seed, index)
         if self.patch_size is None:
             image = case["image"]
             target = case["target"]
@@ -957,7 +1132,9 @@ class TaskPreprocessedDataset(Dataset):
                         "patch_foreground_source='target' requires targets to be present for patch sampling"
                     )
                 crop_reference = case["target"]
-            starts = _sample_starts_from_precomputed(case, self.patch_size, rng)
+            starts = _sample_starts_from_locations(case, self.patch_size, rng)
+            if starts is None:
+                starts = _sample_starts_from_precomputed(case, self.patch_size, rng)
             if starts is None:
                 starts = _compute_crop_starts_with_threshold(
                     crop_reference,
@@ -978,6 +1155,9 @@ class TaskPreprocessedDataset(Dataset):
                 )
             if self.patch_size is not None:
                 evaluation_reference = _crop_with_starts(evaluation_reference, self.patch_size, starts)
+        stored_mask = case.get("mask")
+        if stored_mask is not None and self.patch_size is not None:
+            stored_mask = _crop_with_starts(stored_mask[None], self.patch_size, starts)[0]
         sample = {
             "image": torch.from_numpy(np.asarray(image)).float(),
             "identifier": identifier,
@@ -999,6 +1179,8 @@ class TaskPreprocessedDataset(Dataset):
             else:
                 sample["evaluation_reference"] = sample["evaluation_reference"].float()
             sample["evaluation_properties"] = case.get("evaluation_properties")
+        if stored_mask is not None:
+            sample["mask"] = torch.from_numpy(np.asarray(stored_mask != 0)).bool()
         if self.transform is not None:
             sample = self.transform(sample)
         return sample
@@ -1065,7 +1247,7 @@ class UnpairedGenerativeDataset(Dataset):
         return max(len(self.identifiers_a), len(self.identifiers_b))
 
     def __getitem__(self, index: int) -> Dict:
-        rng = np.random.RandomState(self.seed + index)
+        rng = _build_runtime_rng(self.seed, index)
         identifier_a = self.identifiers_a[index % len(self.identifiers_a)]
         identifier_b = (
             self.identifiers_b[int(rng.randint(0, len(self.identifiers_b)))]
@@ -1074,8 +1256,12 @@ class UnpairedGenerativeDataset(Dataset):
         )
         case_a = load_preprocessed_case(self.folder_a, identifier_a)
         case_b = load_preprocessed_case(self.folder_b, identifier_b)
-        starts_a = _sample_starts_from_precomputed(case_a, self.patch_size, rng) if self.patch_size is not None else None
-        starts_b = _sample_starts_from_precomputed(case_b, self.patch_size, rng) if self.patch_size is not None else None
+        starts_a = _sample_starts_from_locations(case_a, self.patch_size, rng) if self.patch_size is not None else None
+        if starts_a is None and self.patch_size is not None:
+            starts_a = _sample_starts_from_precomputed(case_a, self.patch_size, rng)
+        starts_b = _sample_starts_from_locations(case_b, self.patch_size, rng) if self.patch_size is not None else None
+        if starts_b is None and self.patch_size is not None:
+            starts_b = _sample_starts_from_precomputed(case_b, self.patch_size, rng)
         sample = {
             "image_a": torch.from_numpy(
                 np.asarray(
@@ -1096,6 +1282,20 @@ class UnpairedGenerativeDataset(Dataset):
             "properties_a": case_a["properties"],
             "properties_b": case_b["properties"],
         }
+        if case_a.get("mask") is not None:
+            mask_a = (
+                _crop_with_starts(case_a["mask"][None], self.patch_size, starts_a)[0]
+                if starts_a is not None
+                else _crop_or_pad(case_a["mask"][None], self.patch_size, rng)[0]
+            )
+            sample["mask_a"] = torch.from_numpy(np.asarray(mask_a != 0)).bool()
+        if case_b.get("mask") is not None:
+            mask_b = (
+                _crop_with_starts(case_b["mask"][None], self.patch_size, starts_b)[0]
+                if starts_b is not None
+                else _crop_or_pad(case_b["mask"][None], self.patch_size, rng)[0]
+            )
+            sample["mask_b"] = torch.from_numpy(np.asarray(mask_b != 0)).bool()
         if self.transform is not None:
             sample = self.transform(sample)
         return sample

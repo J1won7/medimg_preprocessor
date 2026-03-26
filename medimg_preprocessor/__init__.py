@@ -30,6 +30,11 @@ from .planning import (
     extract_fingerprint_from_cases,
     plan_preprocessing_from_cases,
 )
+from .inference import (
+    InferencePatchAccumulator,
+    RawInferenceCase,
+    RawInferencePatchDataset,
+)
 
 try:
     from .imageio import (
@@ -96,6 +101,9 @@ __all__ = [
     "determine_transpose",
     "extract_fingerprint_from_cases",
     "plan_preprocessing_from_cases",
+    "InferencePatchAccumulator",
+    "RawInferenceCase",
+    "RawInferencePatchDataset",
 ]
 
 _imageio_exports = [

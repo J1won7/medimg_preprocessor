@@ -6,7 +6,7 @@ from typing import List, Sequence, Tuple
 import warnings
 
 import numpy as np
-from scipy.ndimage import binary_fill_holes, map_coordinates
+from scipy.ndimage import binary_closing, binary_fill_holes, generate_binary_structure, label, map_coordinates
 from skimage.transform import resize
 
 
@@ -25,6 +25,61 @@ def create_nonzero_mask(data: np.ndarray) -> np.ndarray:
     for c in range(1, data.shape[0]):
         mask |= data[c] != 0
     return binary_fill_holes(mask)
+
+
+def create_threshold_mask(data: np.ndarray, threshold: float) -> np.ndarray:
+    if data.ndim not in (3, 4):
+        _fail_validation(f"Expected data with shape (C, X, Y) or (C, X, Y, Z), got {data.shape}")
+    mask = data[0] > float(threshold)
+    for c in range(1, data.shape[0]):
+        mask |= data[c] > float(threshold)
+    return mask
+
+
+def ensure_binary_mask(mask: np.ndarray, *, spatial_shape: Sequence[int], name: str = "mask") -> np.ndarray:
+    if not isinstance(mask, np.ndarray):
+        _fail_validation(f"{name} must be a numpy.ndarray, got {type(mask).__name__}")
+    if mask.ndim == len(spatial_shape):
+        reduced = mask
+    elif mask.ndim == len(spatial_shape) + 1:
+        if tuple(mask.shape[1:]) != tuple(spatial_shape):
+            _fail_validation(
+                f"{name} spatial shape must match image, got {mask.shape[1:]} and {tuple(spatial_shape)}"
+            )
+        reduced = np.any(mask != 0, axis=0)
+    else:
+        _fail_validation(
+            f"{name} must have shape {tuple(spatial_shape)} or (C, {', '.join(str(i) for i in spatial_shape)}), got {mask.shape}"
+        )
+    if tuple(reduced.shape) != tuple(spatial_shape):
+        _fail_validation(f"{name} spatial shape must match image, got {reduced.shape} and {tuple(spatial_shape)}")
+    return np.asarray(reduced != 0, dtype=bool)
+
+
+def postprocess_binary_mask(
+    mask: np.ndarray,
+    *,
+    fill_holes: bool = True,
+    keep_largest_component: bool = True,
+    closing_iters: int = 1,
+) -> np.ndarray:
+    mask = np.asarray(mask, dtype=bool)
+    if fill_holes:
+        mask = binary_fill_holes(mask)
+    if closing_iters > 0:
+        structure = generate_binary_structure(mask.ndim, 1)
+        mask = binary_closing(mask, structure=structure, iterations=int(closing_iters))
+    if keep_largest_component and np.any(mask):
+        structure = generate_binary_structure(mask.ndim, 1)
+        labeled, num = label(mask, structure=structure)
+        if num > 1:
+            component_sizes = np.bincount(labeled.ravel())
+            component_sizes[0] = 0
+            largest = int(np.argmax(component_sizes))
+            mask = labeled == largest
+    if fill_holes:
+        mask = binary_fill_holes(mask)
+    return np.asarray(mask, dtype=bool)
 
 
 def get_bbox_from_mask(mask: np.ndarray) -> List[List[int]]:

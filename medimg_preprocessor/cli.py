@@ -40,16 +40,16 @@ DESCRIPTION = """medimg_preprocessor CLI
 
 PREPROCESS_DATASET_EPILOG = """예시:
   Segmentation:
-    python -m medimg_preprocessor preprocess-dataset --task-mode segmentation --images-dir raw/imagesTr --labels-dir raw/labelsTr --output-folder preprocessed_seg
+    python -m medimg_preprocessor preprocess-dataset --task-mode segmentation --images-dir raw/imagesTr --target-dir raw/labelsTr --output-folder preprocessed_seg
 
   Segmentation with multi-image inputs:
-    python -m medimg_preprocessor preprocess-dataset --task-mode segmentation --images-dir raw/imagesTr --labels-dir raw/labelsTr --output-folder preprocessed_seg --multi-image
+    python -m medimg_preprocessor preprocess-dataset --task-mode segmentation --images-dir raw/imagesTr --target-dir raw/labelsTr --output-folder preprocessed_seg --multi-image
 
   Paired generative:
-    python -m medimg_preprocessor preprocess-dataset --task-mode paired_generative --source-dir raw/source --target-dir raw/target --output-folder preprocessed_paired
+    python -m medimg_preprocessor preprocess-dataset --task-mode paired_generative --images-dir raw/source --target-dir raw/target --output-folder preprocessed_paired
 
   Unpaired generative:
-    python -m medimg_preprocessor preprocess-dataset --task-mode unpaired_generative --domain-a-dir raw/domain_a --domain-b-dir raw/domain_b --output-folder preprocessed_unpaired
+    python -m medimg_preprocessor preprocess-dataset --task-mode unpaired_generative --images-dir raw/domain_a --target-dir raw/domain_b --output-folder preprocessed_unpaired
 """
 
 
@@ -100,6 +100,7 @@ NORMALIZATION_METHOD_CHOICES = (
     "ZScoreNormalization",
     "MinMaxClipNormalization",
 )
+MASK_THRESHOLD_UNSET = object()
 
 
 def _log_stage(step: int, total_steps: int, title: str, detail: Optional[str] = None) -> None:
@@ -266,6 +267,28 @@ def _build_reader(reader_name: str, example_file: str, dataset_json_content: Opt
     if reader_name not in registry:
         raise ValueError(f"Unsupported reader '{reader_name}'")
     return registry[reader_name]()
+
+
+def _parse_optional_float_arg(value: str) -> Optional[float]:
+    lowered = str(value).strip().lower()
+    if lowered in {"none", "null"}:
+        return None
+    return float(value)
+
+
+def _resolve_mask_thresholds(args: argparse.Namespace) -> tuple[Optional[float], Optional[float]]:
+    common = args.mask_threshold
+    image = args.images_mask_threshold
+    target = args.target_mask_threshold
+
+    def _resolve(specific):
+        if specific is not MASK_THRESHOLD_UNSET:
+            return specific
+        if common is not MASK_THRESHOLD_UNSET:
+            return common
+        return None
+
+    return _resolve(image), _resolve(target)
 
 
 def _prepare_output_prefix(output_folder: Path, identifier: str) -> Path:
@@ -613,10 +636,17 @@ def _preprocess_case(
     storage_format: str = "blosc2",
     patch_size_hint: Optional[Sequence[int]] = None,
     patch_sampling_patch_sizes: Optional[dict[str, tuple[int, ...]]] = None,
-    patch_sampling_threshold: Optional[float] = None,
     patch_sampling_min_fraction: float = 0.0,
-    patch_sampling_source: str = "image",
     patch_sampling_max_starts: int = 8192,
+    image_mask_files: Optional[list[str] | str] = None,
+    target_mask_files: Optional[list[str] | str] = None,
+    mask_reader_name: Optional[str] = None,
+    mask_mode: Optional[str] = None,
+    image_mask_threshold: Optional[float] = None,
+    target_mask_threshold: Optional[float] = None,
+    mask_fill_holes: bool = True,
+    mask_keep_largest_component: bool = True,
+    mask_closing_iters: int = 1,
 ) -> None:
     from .preprocessing import TaskAwarePreprocessor
 
@@ -630,6 +660,14 @@ def _preprocess_case(
             reference_example,
             reference_dataset_json or image_dataset_json,
         )
+    mask_reader = None
+    mask_example = None
+    if image_mask_files is not None:
+        mask_example = image_mask_files if isinstance(image_mask_files, str) else image_mask_files[0]
+    elif target_mask_files is not None:
+        mask_example = target_mask_files if isinstance(target_mask_files, str) else target_mask_files[0]
+    if mask_example is not None:
+        mask_reader = _build_reader(mask_reader_name or image_reader_name, mask_example, image_dataset_json)
     case = preprocessor.run_task_case_from_files(
         image_files=image_files,
         image_reader=image_reader,
@@ -637,6 +675,15 @@ def _preprocess_case(
         run_stage=run_stage,
         reference_files=reference_files,
         reference_reader=reference_reader,
+        image_mask_files=image_mask_files,
+        target_mask_files=target_mask_files,
+        mask_reader=mask_reader,
+        mask_mode=mask_mode,
+        image_mask_threshold=image_mask_threshold,
+        target_mask_threshold=target_mask_threshold,
+        mask_fill_holes=mask_fill_holes,
+        mask_keep_largest_component=mask_keep_largest_component,
+        mask_closing_iters=mask_closing_iters,
     )
     save_preprocessed_case(
         case,
@@ -644,15 +691,19 @@ def _preprocess_case(
         storage_format=storage_format,
         patch_size_hint=patch_size_hint,
         patch_sampling_patch_sizes=patch_sampling_patch_sizes,
-        patch_sampling_threshold=patch_sampling_threshold,
         patch_sampling_min_fraction=patch_sampling_min_fraction,
-        patch_sampling_source=patch_sampling_source,
         patch_sampling_max_starts=patch_sampling_max_starts,
     )
 
 
 def _preprocess_case_worker(payload: dict) -> None:
     _preprocess_case(**payload)
+
+
+def _scan_optional_mask_dir(folder: Optional[str], label: str) -> Optional[dict[str, list[str]]]:
+    if folder is None:
+        return None
+    return _scan_single_image_dir(folder, label)
 
 
 def _preprocess_segmentation_or_self_supervised(
@@ -664,13 +715,21 @@ def _preprocess_segmentation_or_self_supervised(
     configurations: Optional[dict],
 ) -> str:
     images = _scan_image_dir(args.images_dir, "--images-dir", args.multi_image)
+    image_masks = _scan_optional_mask_dir(args.images_mask_dir, "--images-mask-dir")
+    image_mask_threshold, target_mask_threshold = _resolve_mask_thresholds(args)
     patch_sampling_patch_sizes = _build_patch_sampling_patch_sizes(default_patch_size, configurations)
     output_folder = Path(args.output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
 
     if args.task_mode == TaskMode.SELF_SUPERVISED:
-        if args.labels_dir is not None:
-            raise ValueError("self_supervised does not accept --labels-dir")
+        if args.target_dir is not None:
+            raise ValueError("self_supervised does not accept --target-dir")
+        if args.target_mask_dir is not None:
+            raise ValueError("self_supervised does not accept --target-mask-dir")
+        if target_mask_threshold is not None:
+            raise ValueError("self_supervised does not accept --target-mask-threshold")
+        if image_masks is not None:
+            _assert_matching_identifiers(images, image_masks, "images", "images masks")
         identifiers = sorted(images.keys())
         work_items = [
             {
@@ -685,10 +744,16 @@ def _preprocess_segmentation_or_self_supervised(
                 "storage_format": args.storage_format,
                 "patch_size_hint": default_patch_size,
                 "patch_sampling_patch_sizes": patch_sampling_patch_sizes,
-                "patch_sampling_threshold": args.patch_foreground_threshold,
-                "patch_sampling_min_fraction": args.patch_foreground_min_fraction,
-                "patch_sampling_source": args.patch_foreground_source,
-                "patch_sampling_max_starts": args.patch_foreground_max_starts,
+                "patch_sampling_min_fraction": args.patch_mask_min_fraction,
+                "patch_sampling_max_starts": args.patch_mask_max_starts,
+                "image_mask_files": None if image_masks is None else image_masks[identifier][0],
+                "mask_reader_name": args.mask_reader,
+                "mask_mode": args.masking_mode,
+                "image_mask_threshold": image_mask_threshold,
+                "target_mask_threshold": None,
+                "mask_fill_holes": args.mask_fill_holes,
+                "mask_keep_largest_component": args.mask_keep_largest_component,
+                "mask_closing_iters": args.mask_closing_iters,
             }
             for identifier in identifiers
         ]
@@ -708,12 +773,18 @@ def _preprocess_segmentation_or_self_supervised(
         )
 
     if args.run_stage in {RunStage.TRAIN, RunStage.PREDICT_AND_EVALUATE}:
-        if args.labels_dir is None:
-            raise ValueError("segmentation train/predict_and_evaluate requires --labels-dir")
-    if args.run_stage == RunStage.PREDICT and args.labels_dir is not None:
-        raise ValueError("segmentation predict does not accept --labels-dir")
+        if args.target_dir is None:
+            raise ValueError("segmentation train/predict_and_evaluate requires --target-dir")
+    if args.run_stage == RunStage.PREDICT and args.target_dir is not None:
+        raise ValueError("segmentation predict does not accept --target-dir")
+    if args.masking_mode is not None:
+        raise ValueError("segmentation uses the label-derived mask automatically and does not accept --masking-mode")
+    if args.images_mask_dir is not None or args.target_mask_dir is not None:
+        raise ValueError("segmentation does not accept external mask directories")
+    if image_mask_threshold is not None or target_mask_threshold is not None:
+        raise ValueError("segmentation does not accept mask threshold options")
 
-    labels = _scan_single_image_dir(args.labels_dir, "--labels-dir") if args.labels_dir is not None else None
+    labels = _scan_single_image_dir(args.target_dir, "--target-dir") if args.target_dir is not None else None
     identifiers = sorted(images.keys()) if labels is None else _assert_matching_identifiers(images, labels, "images", "labels")
     work_items = [
         {
@@ -731,10 +802,9 @@ def _preprocess_segmentation_or_self_supervised(
             "storage_format": args.storage_format,
             "patch_size_hint": default_patch_size,
             "patch_sampling_patch_sizes": patch_sampling_patch_sizes,
-            "patch_sampling_threshold": args.patch_foreground_threshold,
-            "patch_sampling_min_fraction": args.patch_foreground_min_fraction,
-            "patch_sampling_source": args.patch_foreground_source,
-            "patch_sampling_max_starts": args.patch_foreground_max_starts,
+            "patch_sampling_min_fraction": args.patch_mask_min_fraction,
+            "patch_sampling_max_starts": args.patch_mask_max_starts,
+            "mask_mode": None,
         }
         for identifier in identifiers
     ]
@@ -762,9 +832,12 @@ def _preprocess_paired(
     default_configuration: Optional[str],
     configurations: Optional[dict],
 ) -> str:
-    if args.source_dir is None:
-        raise ValueError("paired_generative requires --source-dir")
-    sources = _scan_image_dir(args.source_dir, "--source-dir", args.multi_image)
+    if args.images_dir is None:
+        raise ValueError("paired_generative requires --images-dir")
+    sources = _scan_image_dir(args.images_dir, "--images-dir", args.multi_image)
+    source_masks = _scan_optional_mask_dir(args.images_mask_dir, "--images-mask-dir")
+    target_masks = _scan_optional_mask_dir(args.target_mask_dir, "--target-mask-dir")
+    image_mask_threshold, target_mask_threshold = _resolve_mask_thresholds(args)
     patch_sampling_patch_sizes = _build_patch_sampling_patch_sizes(default_patch_size, configurations)
     output_folder = Path(args.output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
@@ -781,6 +854,12 @@ def _preprocess_paired(
         if targets is None
         else _assert_matching_identifiers(sources, targets, "source", "target")
     )
+    if source_masks is not None:
+        _assert_matching_identifiers(sources, source_masks, "source", "source masks")
+    if target_masks is not None:
+        if targets is None:
+            raise ValueError("paired_generative --target-mask-dir requires --target-dir")
+        _assert_matching_identifiers(targets, target_masks, "target", "target masks")
     work_items = [
         {
             "identifier": identifier,
@@ -797,10 +876,17 @@ def _preprocess_paired(
             "storage_format": args.storage_format,
             "patch_size_hint": default_patch_size,
             "patch_sampling_patch_sizes": patch_sampling_patch_sizes,
-            "patch_sampling_threshold": args.patch_foreground_threshold,
-            "patch_sampling_min_fraction": args.patch_foreground_min_fraction,
-            "patch_sampling_source": args.patch_foreground_source,
-            "patch_sampling_max_starts": args.patch_foreground_max_starts,
+            "patch_sampling_min_fraction": args.patch_mask_min_fraction,
+            "patch_sampling_max_starts": args.patch_mask_max_starts,
+            "image_mask_files": None if source_masks is None else source_masks[identifier][0],
+            "target_mask_files": None if target_masks is None else target_masks[identifier][0],
+            "mask_reader_name": args.mask_reader,
+            "mask_mode": args.masking_mode,
+            "image_mask_threshold": image_mask_threshold,
+            "target_mask_threshold": target_mask_threshold,
+            "mask_fill_holes": args.mask_fill_holes,
+            "mask_keep_largest_component": args.mask_keep_largest_component,
+            "mask_closing_iters": args.mask_closing_iters,
         }
         for identifier in identifiers
     ]
@@ -830,13 +916,16 @@ def _preprocess_unpaired(
     default_configuration: Optional[str],
     configurations: Optional[dict],
 ) -> str:
-    if args.domain_a_dir is None or args.domain_b_dir is None:
-        raise ValueError("unpaired_generative requires --domain-a-dir and --domain-b-dir")
+    if args.images_dir is None or args.target_dir is None:
+        raise ValueError("unpaired_generative requires --images-dir and --target-dir")
     if args.run_stage == RunStage.PREDICT_AND_EVALUATE:
         raise ValueError("unpaired_generative does not support predict_and_evaluate")
 
-    domain_a = _scan_image_dir(args.domain_a_dir, "--domain-a-dir", args.multi_image)
-    domain_b = _scan_image_dir(args.domain_b_dir, "--domain-b-dir", args.multi_image)
+    domain_a = _scan_image_dir(args.images_dir, "--images-dir", args.multi_image)
+    domain_b = _scan_image_dir(args.target_dir, "--target-dir", args.multi_image)
+    masks_a = _scan_optional_mask_dir(args.images_mask_dir, "--images-mask-dir")
+    masks_b = _scan_optional_mask_dir(args.target_mask_dir, "--target-mask-dir")
+    image_mask_threshold, target_mask_threshold = _resolve_mask_thresholds(args)
 
     output_folder = Path(args.output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
@@ -848,6 +937,10 @@ def _preprocess_unpaired(
 
     identifiers_a = sorted(domain_a.keys())
     identifiers_b = sorted(domain_b.keys())
+    if masks_a is not None:
+        _assert_matching_identifiers(domain_a, masks_a, "domain A", "domain A masks")
+    if masks_b is not None:
+        _assert_matching_identifiers(domain_b, masks_b, "domain B", "domain B masks")
     work_items_a = [
         {
             "identifier": identifier,
@@ -861,10 +954,17 @@ def _preprocess_unpaired(
             "storage_format": args.storage_format,
             "patch_size_hint": default_patch_size,
             "patch_sampling_patch_sizes": patch_sampling_patch_sizes,
-            "patch_sampling_threshold": args.patch_foreground_threshold,
-            "patch_sampling_min_fraction": args.patch_foreground_min_fraction,
-            "patch_sampling_source": args.patch_foreground_source,
-            "patch_sampling_max_starts": args.patch_foreground_max_starts,
+            "patch_sampling_min_fraction": args.patch_mask_min_fraction,
+            "patch_sampling_max_starts": args.patch_mask_max_starts,
+            "image_mask_files": None if masks_a is None else masks_a[identifier][0],
+            "target_mask_files": None,
+            "mask_reader_name": args.mask_reader,
+            "mask_mode": args.masking_mode,
+            "image_mask_threshold": image_mask_threshold,
+            "target_mask_threshold": None,
+            "mask_fill_holes": args.mask_fill_holes,
+            "mask_keep_largest_component": args.mask_keep_largest_component,
+            "mask_closing_iters": args.mask_closing_iters,
         }
         for identifier in identifiers_a
     ]
@@ -881,10 +981,17 @@ def _preprocess_unpaired(
             "storage_format": args.storage_format,
             "patch_size_hint": default_patch_size,
             "patch_sampling_patch_sizes": patch_sampling_patch_sizes,
-            "patch_sampling_threshold": args.patch_foreground_threshold,
-            "patch_sampling_min_fraction": args.patch_foreground_min_fraction,
-            "patch_sampling_source": args.patch_foreground_source,
-            "patch_sampling_max_starts": args.patch_foreground_max_starts,
+            "patch_sampling_min_fraction": args.patch_mask_min_fraction,
+            "patch_sampling_max_starts": args.patch_mask_max_starts,
+            "image_mask_files": None if masks_b is None else masks_b[identifier][0],
+            "target_mask_files": None,
+            "mask_reader_name": args.mask_reader,
+            "mask_mode": args.masking_mode,
+            "image_mask_threshold": target_mask_threshold,
+            "target_mask_threshold": None,
+            "mask_fill_holes": args.mask_fill_holes,
+            "mask_keep_largest_component": args.mask_keep_largest_component,
+            "mask_closing_iters": args.mask_closing_iters,
         }
         for identifier in identifiers_b
     ]
@@ -927,11 +1034,13 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
     configurations = None
 
     if args.task_mode == TaskMode.UNPAIRED_GENERATIVE:
-        domain_a = _scan_image_dir(args.domain_a_dir, "--domain-a-dir", args.multi_image)
-        domain_b = _scan_image_dir(args.domain_b_dir, "--domain-b-dir", args.multi_image)
+        if args.images_dir is None or args.target_dir is None:
+            raise ValueError("unpaired_generative requires --images-dir and --target-dir")
+        domain_a = _scan_image_dir(args.images_dir, "--images-dir", args.multi_image)
+        domain_b = _scan_image_dir(args.target_dir, "--target-dir", args.multi_image)
         _log_stage(2, total_steps, "Plan preprocessing", f"domain_a={len(domain_a)} cases, domain_b={len(domain_b)} cases")
-        dataset_json_a = _discover_dataset_json(args.domain_a_dir)
-        dataset_json_b = _discover_dataset_json(args.domain_b_dir)
+        dataset_json_a = _discover_dataset_json(args.images_dir)
+        dataset_json_b = _discover_dataset_json(args.target_dir)
         if base_config is not None:
             config_a = config_a or base_config
             config_b = config_b or base_config
@@ -1002,13 +1111,13 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
         if args.task_mode in {TaskMode.SEGMENTATION, TaskMode.SELF_SUPERVISED}:
             if args.images_dir is None:
                 raise ValueError(f"{args.task_mode} requires --images-dir")
-            dataset_json = _discover_dataset_json(args.images_dir, args.labels_dir)
+            dataset_json = _discover_dataset_json(args.images_dir, args.target_dir)
             images = _scan_image_dir(args.images_dir, "--images-dir", args.multi_image)
             labels = (
-                _scan_single_image_dir(args.labels_dir, "--labels-dir")
+                _scan_single_image_dir(args.target_dir, "--target-dir")
                 if args.task_mode == TaskMode.SEGMENTATION
                 and args.run_stage in {RunStage.TRAIN, RunStage.PREDICT_AND_EVALUATE}
-                and args.labels_dir is not None
+                and args.target_dir is not None
                 else None
             )
             if labels is not None:
@@ -1055,10 +1164,10 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                 configurations,
             )
         elif args.task_mode == TaskMode.PAIRED_GENERATIVE:
-            if args.source_dir is None:
-                raise ValueError("paired_generative requires --source-dir")
-            dataset_json = _discover_dataset_json(args.source_dir, args.target_dir)
-            sources = _scan_image_dir(args.source_dir, "--source-dir", args.multi_image)
+            if args.images_dir is None:
+                raise ValueError("paired_generative requires --images-dir")
+            dataset_json = _discover_dataset_json(args.images_dir, args.target_dir)
+            sources = _scan_image_dir(args.images_dir, "--images-dir", args.multi_image)
             targets = (
                 _scan_image_dir(args.target_dir, "--target-dir", args.multi_image)
                 if args.target_dir is not None and args.run_stage in {RunStage.TRAIN, RunStage.PREDICT_AND_EVALUATE}
@@ -1257,12 +1366,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    single_or_seg_group = preprocess_parser.add_argument_group("segmentation / self_supervised 옵션")
+    single_or_seg_group = preprocess_parser.add_argument_group("shared input / target 옵션")
     single_or_seg_group.add_argument("--images-dir", default=None, help="입력 이미지 디렉토리")
     single_or_seg_group.add_argument(
-        "--labels-dir",
+        "--target-dir",
         default=None,
-        help="segmentation label 디렉토리. segmentation train/predict_and_evaluate에서 필요",
+        help=(
+            "target 디렉토리. segmentation에서는 label, paired_generative에서는 paired target, "
+            "unpaired_generative에서는 domain B로 사용됩니다."
+        ),
+    )
+    single_or_seg_group.add_argument(
+        "--label-dir",
+        dest="target_dir",
+        default=None,
+        help="Deprecated alias for --target-dir in segmentation mode.",
+    )
+    single_or_seg_group.add_argument(
+        "--source-dir",
+        dest="images_dir",
+        default=None,
+        help="Deprecated alias for --images-dir in paired_generative mode.",
     )
     single_or_seg_group.add_argument(
         "--image-reader",
@@ -1274,21 +1398,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--reference-reader",
         default=None,
         choices=READER_CHOICES,
-        help="--labels-dir에 사용할 reader. 기본값: --image-reader와 동일",
+        help="--target-dir에 사용할 reader. 기본값: --image-reader와 동일",
     )
 
     paired_group = preprocess_parser.add_argument_group("paired_generative 옵션")
-    paired_group.add_argument("--source-dir", default=None, help="source 이미지 디렉토리")
-    paired_group.add_argument(
-        "--target-dir",
-        default=None,
-        help="target 이미지 디렉토리. paired_generative train/predict_and_evaluate에서 필요",
-    )
     paired_group.add_argument(
         "--source-reader",
         default="auto",
         choices=READER_CHOICES,
-        help="--source-dir에 사용할 reader. 기본값: auto",
+        help="--images-dir에 사용할 reader. 기본값: auto",
     )
     paired_group.add_argument(
         "--target-reader",
@@ -1298,19 +1416,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     preprocess_domain_group = preprocess_parser.add_argument_group("unpaired_generative 옵션")
-    preprocess_domain_group.add_argument("--domain-a-dir", default=None, help="domain A 디렉토리")
-    preprocess_domain_group.add_argument("--domain-b-dir", default=None, help="domain B 디렉토리")
     preprocess_domain_group.add_argument(
         "--domain-a-reader",
         default="auto",
         choices=READER_CHOICES,
-        help="--domain-a-dir에 사용할 reader. 기본값: auto",
+        help="--images-dir(domain A)에 사용할 reader. 기본값: auto",
     )
     preprocess_domain_group.add_argument(
         "--domain-b-reader",
         default="auto",
         choices=READER_CHOICES,
-        help="--domain-b-dir에 사용할 reader. 기본값: auto",
+        help="--target-dir(domain B)에 사용할 reader. 기본값: auto",
     )
     preprocess_domain_group.add_argument(
         "--folder-a-name",
@@ -1321,6 +1437,59 @@ def build_parser() -> argparse.ArgumentParser:
         "--folder-b-name",
         default="domain_b",
         help="unpaired 저장 시 --output-folder 아래에 생성할 domain B 하위 폴더 이름",
+    )
+
+    masking_group = preprocess_parser.add_argument_group("masking options")
+    masking_group.add_argument(
+        "--masking-mode",
+        choices=("threshold",),
+        default=None,
+        help=(
+            "Optional rule for generating a patch sampling mask when no external mask directory is provided. "
+            "Segmentation always uses the label-derived mask automatically. "
+            "If omitted, non-segmentation modes sample from the full spatial extent."
+        ),
+    )
+    masking_group.add_argument("--images-mask-dir", default=None, help="External mask directory aligned with --images-dir")
+    masking_group.add_argument("--target-mask-dir", default=None, help="External mask directory aligned with --target-dir")
+    masking_group.add_argument("--mask-reader", default="auto", choices=READER_CHOICES, help="Reader used for external masks. Default: auto")
+    masking_group.add_argument(
+        "--mask-threshold",
+        type=_parse_optional_float_arg,
+        default=MASK_THRESHOLD_UNSET,
+        help="Common threshold shorthand for both image and target mask generation. Use 'none' to disable.",
+    )
+    masking_group.add_argument(
+        "--images-mask-threshold",
+        type=_parse_optional_float_arg,
+        default=MASK_THRESHOLD_UNSET,
+        help="Threshold for generating an image-side mask. Overrides --mask-threshold for the image side. Use 'none' to disable.",
+    )
+    masking_group.add_argument(
+        "--target-mask-threshold",
+        type=_parse_optional_float_arg,
+        default=MASK_THRESHOLD_UNSET,
+        help="Threshold for generating a target-side mask. Overrides --mask-threshold for the target side. Use 'none' to disable.",
+    )
+    masking_group.add_argument("--mask-fill-holes", action=argparse.BooleanOptionalAction, default=True, help="Fill holes in the generated mask. Default: true")
+    masking_group.add_argument(
+        "--mask-keep-largest-component",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep only the largest connected component in the generated mask. Default: true",
+    )
+    masking_group.add_argument("--mask-closing-iters", type=int, default=1, help="Binary closing iterations applied to generated masks. Default: 1")
+    masking_group.add_argument(
+        "--patch-mask-min-fraction",
+        type=float,
+        default=0.5,
+        help="Legacy fallback option for precomputed valid-start sampling. nnUNet-style dynamic mask-location sampling ignores this in newly preprocessed datasets.",
+    )
+    masking_group.add_argument(
+        "--patch-mask-max-starts",
+        type=int,
+        default=8192,
+        help="Maximum number of foreground/mask voxel locations to store for dynamic patch sampling.",
     )
 
     _build_config_argument_group(
@@ -1346,30 +1515,6 @@ def build_parser() -> argparse.ArgumentParser:
         plans_flag="--plans-b-file",
         configuration_flag="--configuration-b-name",
         label="domain B",
-    )
-    preprocess_parser.add_argument(
-        "--patch-foreground-threshold",
-        type=float,
-        default=-900.0,
-        help="Foreground threshold in pre-normalization intensity space used to precompute valid patch starts.",
-    )
-    preprocess_parser.add_argument(
-        "--patch-foreground-min-fraction",
-        type=float,
-        default=0.0,
-        help="Minimum foreground fraction in a patch required for a start location to be stored. Set 0 to disable.",
-    )
-    preprocess_parser.add_argument(
-        "--patch-foreground-source",
-        choices=("image", "target"),
-        default="image",
-        help="Array used to build the foreground mask for patch sampling metadata.",
-    )
-    preprocess_parser.add_argument(
-        "--patch-foreground-max-starts",
-        type=int,
-        default=8192,
-        help="Maximum number of valid patch start locations to store per patch size.",
     )
     preprocess_parser.add_argument(
         "--ct-clip-min",

@@ -7,7 +7,15 @@ import warnings
 import numpy as np
 
 from .config import PreprocessingConfig
-from .geometry import compute_new_shape, create_nonzero_mask, crop_to_nonzero, resample_array
+from .geometry import (
+    compute_new_shape,
+    create_nonzero_mask,
+    create_threshold_mask,
+    crop_to_nonzero,
+    ensure_binary_mask,
+    postprocess_binary_mask,
+    resample_array,
+)
 from .normalization import get_normalizer
 
 
@@ -61,8 +69,10 @@ class TaskPreprocessedCase:
     task_mode: Optional[str] = None
     run_stage: Optional[str] = None
     reference_type: Optional[str] = None
+    mask: Optional[np.ndarray] = None
     patch_sampling_image: Optional[np.ndarray] = None
     patch_sampling_target: Optional[np.ndarray] = None
+    patch_sampling_mask: Optional[np.ndarray] = None
 
 
 def _fail_validation(message: str) -> None:
@@ -164,6 +174,26 @@ class ModularPreprocessor:
         if target_is_segmentation and target.shape[0] != 1:
             _fail_validation(f"Segmentation target must have exactly one channel, got shape {target.shape}")
 
+    def _validate_sampling_mask(
+        self,
+        image: np.ndarray,
+        image_properties: dict,
+        sampling_mask: np.ndarray | None,
+        sampling_mask_properties: dict | None,
+    ) -> np.ndarray | None:
+        if sampling_mask is None:
+            return None
+        mask = ensure_binary_mask(sampling_mask, spatial_shape=image.shape[1:], name="sampling mask")
+        if sampling_mask_properties is not None:
+            mask_spacing = self._validate_properties(sampling_mask_properties, image.ndim - 1, "sampling mask")
+            image_spacing = self._validate_properties(image_properties, image.ndim - 1, "image")
+            if tuple(mask_spacing) != tuple(image_spacing):
+                _fail_validation(
+                    "sampling mask spacing must match image spacing, "
+                    f"got {tuple(mask_spacing)} and {tuple(image_spacing)}"
+                )
+        return mask
+
     def _validate_case_inputs(
         self,
         image: np.ndarray,
@@ -242,6 +272,8 @@ class ModularPreprocessor:
         settings: Optional[ModularPreprocessingSettings] = None,
         intensity_properties_per_channel: Optional[dict] = None,
         target_is_segmentation: bool = True,
+        sampling_mask: np.ndarray | None = None,
+        sampling_mask_properties: Optional[dict] = None,
     ) -> tuple[np.ndarray, Optional[np.ndarray], dict]:
         mode = PreprocessingMode.SEGMENTATION if target_is_segmentation else PreprocessingMode.GENERATIVE
         settings = _resolve_settings(settings, mode)
@@ -250,12 +282,15 @@ class ModularPreprocessor:
 
         image = image.astype(np.float32, copy=True)
         target = None if target is None else np.copy(target)
+        sampling_mask = self._validate_sampling_mask(image, properties, sampling_mask, sampling_mask_properties)
         spacing = list(self._validate_case_inputs(image, properties, target, target_is_segmentation))
         if settings.transpose:
             axes = [0, *[i + 1 for i in self.config.transpose_forward]]
             image = image.transpose(axes)
             if target is not None:
                 target = target.transpose(axes)
+            if sampling_mask is not None:
+                sampling_mask = sampling_mask.transpose(self.config.transpose_forward)
             spacing = [spacing[i] for i in self.config.transpose_forward]
         properties["spacing_after_transpose"] = spacing
         properties["shape_before_cropping"] = tuple(int(i) for i in image.shape[1:])
@@ -269,6 +304,8 @@ class ModularPreprocessor:
             else:
                 target = cropped_reference
                 mask = target[0] >= 0
+            if sampling_mask is not None:
+                sampling_mask = sampling_mask[tuple(slice(int(b[0]), int(b[1])) for b in bbox)]
         else:
             properties["bbox_used_for_cropping"] = None
             if settings.keep_nonzero_mask or (settings.normalize and any(self.config.use_mask_for_norm)):
@@ -277,6 +314,11 @@ class ModularPreprocessor:
 
         patch_sampling_image = image.copy()
         patch_sampling_target = None if target is None else target.copy()
+        patch_sampling_mask = (
+            sampling_mask.astype(bool, copy=True)
+            if sampling_mask is not None
+            else np.ones(image.shape[1:], dtype=bool)
+        )
 
         if settings.normalize:
             if mask is None and settings.use_nonzero_mask_for_norm_if_no_target and any(self.config.use_mask_for_norm):
@@ -310,6 +352,17 @@ class ModularPreprocessor:
                 force_separate_z=self.config.resampling.force_separate_z,
                 separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
             )
+            patch_sampling_mask = resample_array(
+                patch_sampling_mask[None].astype(np.float32),
+                new_shape,
+                spacing,
+                target_spacing,
+                is_seg=True,
+                order=self.config.resampling.label_order,
+                order_z=self.config.resampling.label_order_z,
+                force_separate_z=self.config.resampling.force_separate_z,
+                separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+            )[0] > 0
             if target is not None:
                 if target_is_segmentation:
                     target = resample_array(
@@ -374,6 +427,8 @@ class ModularPreprocessor:
             target = target.astype(np.int16 if (np.max(target) > 127 or np.min(target) < -128) else np.int8, copy=False)
         properties["__patch_sampling_image"] = patch_sampling_image
         properties["__patch_sampling_target"] = patch_sampling_target
+        properties["__patch_sampling_mask"] = patch_sampling_mask.astype(np.uint8, copy=False)
+        properties["__stored_mask"] = patch_sampling_mask.astype(np.uint8, copy=False)
         return image, target, properties
 
 
@@ -486,6 +541,8 @@ class TaskAwarePreprocessor:
         settings: Optional[ModularPreprocessingSettings],
         input_intensity_properties_per_channel: Optional[dict],
         reference_intensity_properties_per_channel: Optional[dict],
+        sampling_mask: np.ndarray | None = None,
+        sampling_mask_properties: Optional[dict] = None,
     ) -> tuple[np.ndarray, np.ndarray, dict]:
         settings = _resolve_settings(settings, PreprocessingMode.GENERATIVE)
         self.generative_preprocessor._validate_array(image, "source image")
@@ -501,6 +558,12 @@ class TaskAwarePreprocessor:
             )
         image = image.astype(np.float32, copy=True)
         reference = reference.astype(np.float32, copy=True)
+        sampling_mask = self.generative_preprocessor._validate_sampling_mask(
+            image,
+            image_properties,
+            sampling_mask,
+            sampling_mask_properties,
+        )
         properties = dict(image_properties)
         spacing = list(self.generative_preprocessor._validate_properties(image_properties, image.ndim - 1, "source image"))
         reference_spacing = self.generative_preprocessor._validate_properties(
@@ -528,6 +591,8 @@ class TaskAwarePreprocessor:
             axes = [0, *[i + 1 for i in self.config.transpose_forward]]
             image = image.transpose(axes)
             reference = reference.transpose(axes)
+            if sampling_mask is not None:
+                sampling_mask = sampling_mask.transpose(self.config.transpose_forward)
             spacing = [spacing[i] for i in self.config.transpose_forward]
         properties["spacing_after_transpose"] = spacing
 
@@ -538,6 +603,8 @@ class TaskAwarePreprocessor:
             reference = stacked[image.shape[0] :]
             mask = mask_ref[0] >= 0
             properties["bbox_used_for_cropping"] = bbox
+            if sampling_mask is not None:
+                sampling_mask = sampling_mask[tuple(slice(int(b[0]), int(b[1])) for b in bbox)]
         else:
             properties["bbox_used_for_cropping"] = None
             if settings.normalize and any(self.config.use_mask_for_norm):
@@ -546,6 +613,11 @@ class TaskAwarePreprocessor:
 
         patch_sampling_image = image.copy()
         patch_sampling_reference = reference.copy()
+        patch_sampling_mask = (
+            sampling_mask.astype(bool, copy=True)
+            if sampling_mask is not None
+            else np.ones(image.shape[1:], dtype=bool)
+        )
 
         if settings.normalize:
             image = self.generative_preprocessor._normalize(
@@ -608,6 +680,17 @@ class TaskAwarePreprocessor:
                 force_separate_z=self.config.resampling.force_separate_z,
                 separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
             )
+            patch_sampling_mask = resample_array(
+                patch_sampling_mask[None].astype(np.float32),
+                new_shape,
+                spacing,
+                target_spacing,
+                is_seg=True,
+                order=self.config.resampling.label_order,
+                order_z=self.config.resampling.label_order_z,
+                force_separate_z=self.config.resampling.force_separate_z,
+                separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+            )[0] > 0
             properties["spacing_after_resampling"] = target_spacing
             properties["shape_after_resampling"] = tuple(int(i) for i in new_shape)
         else:
@@ -615,6 +698,8 @@ class TaskAwarePreprocessor:
             properties["shape_after_resampling"] = image.shape[1:]
         properties["__patch_sampling_image"] = patch_sampling_image
         properties["__patch_sampling_target"] = patch_sampling_reference
+        properties["__patch_sampling_mask"] = patch_sampling_mask.astype(np.uint8, copy=False)
+        properties["__stored_mask"] = patch_sampling_mask.astype(np.uint8, copy=False)
         return image, reference, properties
 
     def run_task_case(
@@ -628,6 +713,8 @@ class TaskAwarePreprocessor:
         image_settings: Optional[ModularPreprocessingSettings] = None,
         input_intensity_properties_per_channel: Optional[dict] = None,
         reference_intensity_properties_per_channel: Optional[dict] = None,
+        sampling_mask: np.ndarray | None = None,
+        sampling_mask_properties: Optional[dict] = None,
     ) -> TaskPreprocessedCase:
         self._validate_task_request(task_mode, run_stage, image, image_properties, reference, reference_properties)
         if task_mode == TaskMode.SEGMENTATION and run_stage == RunStage.TRAIN:
@@ -637,6 +724,8 @@ class TaskAwarePreprocessor:
                 target=reference,
                 settings=image_settings,
                 intensity_properties_per_channel=input_intensity_properties_per_channel,
+                sampling_mask=sampling_mask,
+                sampling_mask_properties=sampling_mask_properties,
             )
             return TaskPreprocessedCase(
                 image=image_pp,
@@ -646,8 +735,10 @@ class TaskAwarePreprocessor:
                 task_mode=task_mode,
                 run_stage=run_stage,
                 reference_type="segmentation",
+                mask=properties.pop("__stored_mask", None),
                 patch_sampling_image=properties.pop("__patch_sampling_image", None),
                 patch_sampling_target=properties.pop("__patch_sampling_target", None),
+                patch_sampling_mask=properties.pop("__patch_sampling_mask", None),
             )
 
         if task_mode == TaskMode.SEGMENTATION and run_stage == RunStage.PREDICT:
@@ -657,6 +748,8 @@ class TaskAwarePreprocessor:
                 target=None,
                 settings=image_settings,
                 intensity_properties_per_channel=input_intensity_properties_per_channel,
+                sampling_mask=sampling_mask,
+                sampling_mask_properties=sampling_mask_properties,
             )
             return TaskPreprocessedCase(
                 image=image_pp,
@@ -664,7 +757,9 @@ class TaskAwarePreprocessor:
                 task_mode=task_mode,
                 run_stage=run_stage,
                 reference_type="none",
+                mask=properties.pop("__stored_mask", None),
                 patch_sampling_image=properties.pop("__patch_sampling_image", None),
+                patch_sampling_mask=properties.pop("__patch_sampling_mask", None),
             )
 
         if task_mode == TaskMode.SEGMENTATION and run_stage == RunStage.PREDICT_AND_EVALUATE:
@@ -674,6 +769,8 @@ class TaskAwarePreprocessor:
                 target=None,
                 settings=image_settings,
                 intensity_properties_per_channel=input_intensity_properties_per_channel,
+                sampling_mask=sampling_mask,
+                sampling_mask_properties=sampling_mask_properties,
             )
             return TaskPreprocessedCase(
                 image=image_pp,
@@ -683,7 +780,9 @@ class TaskAwarePreprocessor:
                 task_mode=task_mode,
                 run_stage=run_stage,
                 reference_type="segmentation",
+                mask=properties.pop("__stored_mask", None),
                 patch_sampling_image=properties.pop("__patch_sampling_image", None),
+                patch_sampling_mask=properties.pop("__patch_sampling_mask", None),
             )
 
         if task_mode == TaskMode.PAIRED_GENERATIVE and run_stage == RunStage.TRAIN:
@@ -695,6 +794,8 @@ class TaskAwarePreprocessor:
                 image_settings,
                 input_intensity_properties_per_channel,
                 reference_intensity_properties_per_channel,
+                sampling_mask,
+                sampling_mask_properties,
             )
             return TaskPreprocessedCase(
                 image=image_pp,
@@ -704,8 +805,10 @@ class TaskAwarePreprocessor:
                 task_mode=task_mode,
                 run_stage=run_stage,
                 reference_type="image",
+                mask=properties.pop("__stored_mask", None),
                 patch_sampling_image=properties.pop("__patch_sampling_image", None),
                 patch_sampling_target=properties.pop("__patch_sampling_target", None),
+                patch_sampling_mask=properties.pop("__patch_sampling_mask", None),
             )
 
         image_pp, _, properties = self.generative_preprocessor.run_case(
@@ -714,6 +817,8 @@ class TaskAwarePreprocessor:
             target=None,
             settings=image_settings,
             intensity_properties_per_channel=input_intensity_properties_per_channel,
+            sampling_mask=sampling_mask,
+            sampling_mask_properties=sampling_mask_properties,
         )
         case = TaskPreprocessedCase(
             image=image_pp,
@@ -721,7 +826,9 @@ class TaskAwarePreprocessor:
             task_mode=task_mode,
             run_stage=run_stage,
             reference_type="none",
+            mask=properties.pop("__stored_mask", None),
             patch_sampling_image=properties.pop("__patch_sampling_image", None),
+            patch_sampling_mask=properties.pop("__patch_sampling_mask", None),
         )
         if run_stage == RunStage.PREDICT_AND_EVALUATE:
             case.evaluation_reference = reference
@@ -739,6 +846,15 @@ class TaskAwarePreprocessor:
         image_settings: Optional[ModularPreprocessingSettings] = None,
         input_intensity_properties_per_channel: Optional[dict] = None,
         reference_intensity_properties_per_channel: Optional[dict] = None,
+        image_mask_files: Optional[Sequence[str] | str] = None,
+        target_mask_files: Optional[Sequence[str] | str] = None,
+        mask_reader=None,
+        mask_mode: Optional[str] = None,
+        image_mask_threshold: Optional[float] = None,
+        target_mask_threshold: Optional[float] = None,
+        mask_fill_holes: bool = True,
+        mask_keep_largest_component: bool = True,
+        mask_closing_iters: int = 1,
     ) -> TaskPreprocessedCase:
         if not hasattr(image_reader, "read_images"):
             _fail_validation("image_reader must provide a read_images(image_fnames) method")
@@ -757,6 +873,64 @@ class TaskAwarePreprocessor:
                     _fail_validation("reference_reader must provide read_images(image_fnames) for sequence reference_files")
                 reference, reference_properties = reader.read_images(tuple(reference_files))
 
+        sampling_mask = None
+        sampling_mask_properties = None
+        if task_mode == TaskMode.SEGMENTATION and reference is not None:
+            sampling_mask = ensure_binary_mask(reference, spatial_shape=image.shape[1:], name="segmentation reference mask")
+            sampling_mask_properties = reference_properties
+        else:
+            candidate_masks: list[np.ndarray] = []
+            if image_mask_files is not None:
+                reader = mask_reader or image_reader
+                if isinstance(image_mask_files, str):
+                    if not hasattr(reader, "read_seg"):
+                        _fail_validation("mask_reader must provide read_seg(mask_fname) for string image mask files")
+                    mask_array, _ = reader.read_seg(image_mask_files)
+                else:
+                    if not hasattr(reader, "read_images"):
+                        _fail_validation("mask_reader must provide read_images(image_fnames) for sequence image mask files")
+                    mask_array, _ = reader.read_images(tuple(image_mask_files))
+                candidate_masks.append(
+                    ensure_binary_mask(mask_array, spatial_shape=image.shape[1:], name="image sampling mask")
+                )
+            if target_mask_files is not None:
+                if reference is None:
+                    _fail_validation("target_mask_files requires a target/reference image")
+                reader = mask_reader or reference_reader or image_reader
+                if isinstance(target_mask_files, str):
+                    if not hasattr(reader, "read_seg"):
+                        _fail_validation("mask_reader must provide read_seg(mask_fname) for string target mask files")
+                    mask_array, _ = reader.read_seg(target_mask_files)
+                else:
+                    if not hasattr(reader, "read_images"):
+                        _fail_validation("mask_reader must provide read_images(image_fnames) for sequence target mask files")
+                    mask_array, _ = reader.read_images(tuple(target_mask_files))
+                candidate_masks.append(
+                    ensure_binary_mask(mask_array, spatial_shape=image.shape[1:], name="target sampling mask")
+                )
+            if mask_mode == "threshold":
+                if image_mask_threshold is None and target_mask_threshold is None:
+                    _fail_validation("mask_mode='threshold' requires at least one of image_mask_threshold or target_mask_threshold")
+                if image_mask_threshold is not None:
+                    candidate_masks.append(create_threshold_mask(image, float(image_mask_threshold)))
+                if target_mask_threshold is not None:
+                    if reference is None:
+                        _fail_validation("target_mask_threshold requires a target/reference image")
+                    candidate_masks.append(create_threshold_mask(reference, float(target_mask_threshold)))
+            if candidate_masks:
+                sampling_mask = np.zeros(image.shape[1:], dtype=bool)
+                for candidate in candidate_masks:
+                    sampling_mask |= np.asarray(candidate).astype(bool)
+                sampling_mask_properties = image_properties
+
+        if sampling_mask is not None:
+            sampling_mask = postprocess_binary_mask(
+                sampling_mask,
+                fill_holes=bool(mask_fill_holes),
+                keep_largest_component=bool(mask_keep_largest_component),
+                closing_iters=int(mask_closing_iters),
+            )
+
         return self.run_task_case(
             image=image,
             image_properties=image_properties,
@@ -767,6 +941,8 @@ class TaskAwarePreprocessor:
             image_settings=image_settings,
             input_intensity_properties_per_channel=input_intensity_properties_per_channel,
             reference_intensity_properties_per_channel=reference_intensity_properties_per_channel,
+            sampling_mask=sampling_mask,
+            sampling_mask_properties=sampling_mask_properties,
         )
 
     def run_unpaired_case_pair(
