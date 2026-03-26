@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from dataclasses import asdict
+from functools import lru_cache
 import json
 import os
 import pickle
@@ -574,7 +575,8 @@ def load_preprocessed_dataset_manifest(folder: str) -> dict:
     return manifest
 
 
-def load_preprocessed_case(folder: str, identifier: str) -> dict:
+@lru_cache(maxsize=512)
+def _load_preprocessed_case_cached(folder: str, identifier: str) -> dict:
     if not os.path.isdir(folder):
         _fail_validation(f"Preprocessed case folder does not exist: {folder}")
     b2nd_image_file = os.path.join(folder, identifier + ".b2nd")
@@ -652,6 +654,10 @@ def load_preprocessed_case(folder: str, identifier: str) -> dict:
     return case
 
 
+def load_preprocessed_case(folder: str, identifier: str) -> dict:
+    return dict(_load_preprocessed_case_cached(str(folder), str(identifier)))
+
+
 def _list_identifiers(folder: str) -> list[str]:
     if not os.path.isdir(folder):
         _fail_validation(f"Preprocessed dataset folder does not exist: {folder}")
@@ -695,6 +701,24 @@ def _resolve_patch_size(array: np.ndarray, patch_size: Optional[Sequence[int]], 
     _fail_validation(
         f"{context} expects patch_size with {spatial_dims} spatial dims, got {len(patch_size)} "
         f"for array shape {array.shape}"
+    )
+
+
+def _resolve_patch_size_from_spatial_shape(
+    spatial_shape: Sequence[int],
+    patch_size: Optional[Sequence[int]],
+    context: str,
+) -> Optional[tuple[int, ...]]:
+    if patch_size is None:
+        return None
+    spatial_dims = len(tuple(int(i) for i in spatial_shape))
+    if len(patch_size) == spatial_dims:
+        return tuple(int(i) for i in patch_size)
+    if spatial_dims == 3 and len(patch_size) == 2:
+        return (1, int(patch_size[0]), int(patch_size[1]))
+    _fail_validation(
+        f"{context} expects patch_size with {spatial_dims} spatial dims, got {len(patch_size)} "
+        f"for spatial shape {tuple(int(i) for i in spatial_shape)}"
     )
 
 
@@ -1002,8 +1026,7 @@ def _sample_starts_from_locations(
     locations = _gather_sampling_locations(case)
     if len(locations) == 0:
         return None
-    patch_array = np.zeros((1, *case["image"].shape[1:]), dtype=np.uint8)
-    target = _resolve_patch_size(patch_array, patch_size, "location sampling")
+    target = _resolve_patch_size_from_spatial_shape(case["image"].shape[1:], patch_size, "location sampling")
     if target is None:
         return None
     spatial_shape = tuple(int(i) for i in case["image"].shape[1:])
@@ -1110,6 +1133,58 @@ class TaskPreprocessedDataset(Dataset):
     def __len__(self) -> int:
         return len(self.identifiers)
 
+    def _compute_patch_starts_for_case(
+        self,
+        case: dict,
+        identifier: str,
+        rng: np.random.RandomState,
+    ) -> Optional[Tuple[int, ...]]:
+        if self.patch_size is None:
+            return None
+        if case["target"] is not None and tuple(case["image"].shape[1:]) != tuple(case["target"].shape[1:]):
+            _fail_validation(
+                f"Case '{identifier}' has mismatched image/target shapes: "
+                f"{case['image'].shape[1:]} vs {case['target'].shape[1:]}"
+            )
+        crop_reference = case["image"]
+        if self.patch_foreground_source == "target":
+            if case["target"] is None:
+                _fail_validation(
+                    "patch_foreground_source='target' requires targets to be present for patch sampling"
+                )
+            crop_reference = case["target"]
+        starts = _sample_starts_from_locations(case, self.patch_size, rng)
+        if starts is None:
+            starts = _sample_starts_from_precomputed(case, self.patch_size, rng)
+        if starts is None:
+            starts = _compute_crop_starts_with_threshold(
+                crop_reference,
+                self.patch_size,
+                rng,
+                threshold=self.patch_foreground_threshold,
+                min_fraction=self.patch_foreground_min_fraction,
+                max_tries=self.patch_foreground_max_tries,
+            )
+        return starts
+
+    def get_target_only(self, index: int) -> Dict[str, Any]:
+        identifier = self.identifiers[index]
+        case = load_preprocessed_case(self.folder, identifier)
+        if case["target"] is None:
+            _fail_validation(f"Case '{identifier}' does not have a target")
+        rng = _build_runtime_rng(self.seed, index)
+        starts = self._compute_patch_starts_for_case(case, identifier, rng)
+        target = case["target"] if starts is None else _crop_with_starts(case["target"], self.patch_size, starts)
+        target_tensor = torch.from_numpy(np.asarray(target))
+        if np.issubdtype(target.dtype, np.integer):
+            target_tensor = target_tensor.long()
+        else:
+            target_tensor = target_tensor.float()
+        return {
+            "target": target_tensor,
+            "identifier": identifier,
+        }
+
     def __getitem__(self, index: int) -> Dict:
         identifier = self.identifiers[index]
         case = load_preprocessed_case(self.folder, identifier)
@@ -1119,31 +1194,9 @@ class TaskPreprocessedDataset(Dataset):
         if self.patch_size is None:
             image = case["image"]
             target = case["target"]
+            starts = None
         else:
-            if case["target"] is not None and tuple(case["image"].shape[1:]) != tuple(case["target"].shape[1:]):
-                _fail_validation(
-                    f"Case '{identifier}' has mismatched image/target shapes: "
-                    f"{case['image'].shape[1:]} vs {case['target'].shape[1:]}"
-                )
-            crop_reference = case["image"]
-            if self.patch_foreground_source == "target":
-                if case["target"] is None:
-                    _fail_validation(
-                        "patch_foreground_source='target' requires targets to be present for patch sampling"
-                    )
-                crop_reference = case["target"]
-            starts = _sample_starts_from_locations(case, self.patch_size, rng)
-            if starts is None:
-                starts = _sample_starts_from_precomputed(case, self.patch_size, rng)
-            if starts is None:
-                starts = _compute_crop_starts_with_threshold(
-                    crop_reference,
-                    self.patch_size,
-                    rng,
-                    threshold=self.patch_foreground_threshold,
-                    min_fraction=self.patch_foreground_min_fraction,
-                    max_tries=self.patch_foreground_max_tries,
-                )
+            starts = self._compute_patch_starts_for_case(case, identifier, rng)
             image = _crop_with_starts(case["image"], self.patch_size, starts)
             target = _crop_with_starts(case["target"], self.patch_size, starts) if case["target"] is not None else None
         evaluation_reference = case.get("evaluation_reference")
