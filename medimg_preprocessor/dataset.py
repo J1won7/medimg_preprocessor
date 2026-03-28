@@ -575,8 +575,33 @@ def load_preprocessed_dataset_manifest(folder: str) -> dict:
     return manifest
 
 
+def _load_conflict_map(extra_folder: str | None, identifier: str, storage_format: str):
+    if extra_folder is None:
+        return None
+    b2nd_conflict_file = os.path.join(extra_folder, identifier + "_conflict.b2nd")
+    npy_conflict_file = os.path.join(extra_folder, identifier + "_conflict.npy")
+    npz_conflict_file = os.path.join(extra_folder, identifier + "_conflict.npz")
+
+    if storage_format == "blosc2" and os.path.isfile(b2nd_conflict_file):
+        _require_blosc2()
+        blosc2.set_nthreads(1)
+        dparams = {"nthreads": 1}
+        mmap_kwargs = {} if os.name == "nt" else {"mmap_mode": "r"}
+        return blosc2.open(urlpath=b2nd_conflict_file, mode="r", dparams=dparams, **mmap_kwargs)
+    if os.path.isfile(npy_conflict_file):
+        return np.load(npy_conflict_file, mmap_mode="r")
+    if os.path.isfile(npz_conflict_file):
+        with np.load(npz_conflict_file) as arrays:
+            if "conflict_map" not in arrays.files:
+                _fail_validation(
+                    f"Conflict map file for case '{identifier}' must contain a 'conflict_map' array"
+                )
+            return arrays["conflict_map"]
+    return None
+
+
 @lru_cache(maxsize=512)
-def _load_preprocessed_case_cached(folder: str, identifier: str) -> dict:
+def _load_preprocessed_case_cached(folder: str, identifier: str, extra_folder: str | None = None) -> dict:
     if not os.path.isdir(folder):
         _fail_validation(f"Preprocessed case folder does not exist: {folder}")
     b2nd_image_file = os.path.join(folder, identifier + ".b2nd")
@@ -609,15 +634,18 @@ def _load_preprocessed_case_cached(folder: str, identifier: str) -> dict:
             else None
         )
         mask = blosc2.open(urlpath=b2nd_mask_file, mode="r", dparams=dparams, **mmap_kwargs) if os.path.isfile(b2nd_mask_file) else None
+        conflict_map = _load_conflict_map(extra_folder, identifier, storage_format)
         case = {
             "image": image,
             "target": target,
             "evaluation_reference": evaluation_reference,
             "mask": None if mask is None else mask[0],
+            "conflict_map": None if conflict_map is None else conflict_map,
             **meta,
         }
     else:
         with np.load(npz_file) as arrays:
+            conflict_map = _load_conflict_map(extra_folder, identifier, storage_format)
             if "image" not in arrays.files:
                 _fail_validation(f"Preprocessed case '{identifier}' does not contain an 'image' array")
             case = {
@@ -627,6 +655,7 @@ def _load_preprocessed_case_cached(folder: str, identifier: str) -> dict:
                 if "evaluation_reference" in arrays.files
                 else None,
                 "mask": arrays["mask"] if "mask" in arrays.files else None,
+                "conflict_map": None if conflict_map is None else conflict_map,
                 **meta,
             }
     if "properties" not in case or not isinstance(case["properties"], dict):
@@ -649,13 +678,55 @@ def _load_preprocessed_case_cached(folder: str, identifier: str) -> dict:
             f"Preprocessed case '{identifier}' has mismatched image/mask shapes: "
             f"{case['image'].shape[1:]} vs {case['mask'].shape}"
         )
+    if case.get("conflict_map") is not None:
+        conflict_map = case["conflict_map"]
+        expected_shape = tuple(case["image"].shape)
+        expected_spatial = tuple(case["image"].shape[1:])
+        if tuple(conflict_map.shape) == expected_spatial:
+            case["conflict_map"] = np.asarray(conflict_map)[None]
+            conflict_map = case["conflict_map"]
+        if tuple(conflict_map.shape) != expected_shape:
+            _fail_validation(
+                f"Preprocessed case '{identifier}' has mismatched image/conflict_map shapes: "
+                f"{expected_shape} vs {tuple(conflict_map.shape)}"
+            )
     if case.get("mask_locations") is None and case.get("mask") is not None:
         case["mask_locations"] = _sample_mask_locations(np.asarray(case["mask"]))
     return case
 
 
-def load_preprocessed_case(folder: str, identifier: str) -> dict:
-    return dict(_load_preprocessed_case_cached(str(folder), str(identifier)))
+def load_preprocessed_case(folder: str, identifier: str, extra_folder: str | None = None) -> dict:
+    normalized_extra = None if extra_folder is None else str(extra_folder)
+    return dict(_load_preprocessed_case_cached(str(folder), str(identifier), normalized_extra))
+
+
+def save_preprocessed_conflict_map(
+    folder: str,
+    identifier: str,
+    conflict_map: np.ndarray,
+    *,
+    extra_folder: str | None = None,
+    patch_size_hint: Optional[Sequence[int]] = None,
+) -> str:
+    case = load_preprocessed_case(folder, identifier)
+    array = np.asarray(conflict_map, dtype=np.float32)
+    if tuple(array.shape) == tuple(case["image"].shape[1:]):
+        array = array[None]
+    expected_shape = tuple(case["image"].shape)
+    if tuple(array.shape) != expected_shape:
+        _fail_validation(
+            f"conflict_map for case '{identifier}' must match image shape {expected_shape}, got {tuple(array.shape)}"
+        )
+    target_folder = extra_folder if extra_folder is not None else folder
+    os.makedirs(target_folder, exist_ok=True)
+    storage_format = case.get("storage_format", DEFAULT_STORAGE_FORMAT)
+    if storage_format == "blosc2":
+        output_path = os.path.join(target_folder, identifier + "_conflict.b2nd")
+        _save_blosc2_array(np.ascontiguousarray(array), output_path, patch_size_hint)
+    else:
+        output_path = os.path.join(target_folder, identifier + "_conflict.npy")
+        np.save(output_path, np.ascontiguousarray(array))
+    return output_path
 
 
 def _list_identifiers(folder: str) -> list[str]:
@@ -1094,6 +1165,7 @@ class TaskPreprocessedDataset(Dataset):
     def __init__(
         self,
         folder: str,
+        extra_folder: Optional[str] = None,
         identifiers: Optional[Sequence[str]] = None,
         patch_size: Optional[Sequence[int]] = None,
         transform: Optional[Callable[[Dict], Dict]] = None,
@@ -1106,6 +1178,7 @@ class TaskPreprocessedDataset(Dataset):
     ):
         _require_torch()
         self.folder = folder
+        self.extra_folder = extra_folder
         self.identifiers = list(identifiers) if identifiers is not None else _list_identifiers(folder)
         if len(self.identifiers) == 0:
             _fail_validation(f"TaskPreprocessedDataset requires at least one case in folder {folder}")
@@ -1169,7 +1242,7 @@ class TaskPreprocessedDataset(Dataset):
 
     def get_target_only(self, index: int) -> Dict[str, Any]:
         identifier = self.identifiers[index]
-        case = load_preprocessed_case(self.folder, identifier)
+        case = load_preprocessed_case(self.folder, identifier, extra_folder=self.extra_folder)
         if case["target"] is None:
             _fail_validation(f"Case '{identifier}' does not have a target")
         rng = _build_runtime_rng(self.seed, index)
@@ -1187,7 +1260,7 @@ class TaskPreprocessedDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict:
         identifier = self.identifiers[index]
-        case = load_preprocessed_case(self.folder, identifier)
+        case = load_preprocessed_case(self.folder, identifier, extra_folder=self.extra_folder)
         if self.require_target and case["target"] is None:
             _fail_validation(f"Case '{identifier}' does not have a target")
         rng = _build_runtime_rng(self.seed, index)
@@ -1211,6 +1284,9 @@ class TaskPreprocessedDataset(Dataset):
         stored_mask = case.get("mask")
         if stored_mask is not None and self.patch_size is not None:
             stored_mask = _crop_with_starts(stored_mask[None], self.patch_size, starts)[0]
+        conflict_map = case.get("conflict_map")
+        if conflict_map is not None and self.patch_size is not None:
+            conflict_map = _crop_with_starts(conflict_map, self.patch_size, starts)
         sample = {
             "image": torch.from_numpy(np.asarray(image)).float(),
             "identifier": identifier,
@@ -1234,6 +1310,8 @@ class TaskPreprocessedDataset(Dataset):
             sample["evaluation_properties"] = case.get("evaluation_properties")
         if stored_mask is not None:
             sample["mask"] = torch.from_numpy(np.asarray(stored_mask != 0)).bool()
+        if conflict_map is not None:
+            sample["conflict_map"] = torch.from_numpy(np.asarray(conflict_map)).float()
         if self.transform is not None:
             sample = self.transform(sample)
         return sample
@@ -1357,7 +1435,9 @@ class UnpairedGenerativeDataset(Dataset):
 def load_preprocessed_dataset(
     folder: str,
     *,
+    extra_folder: Optional[str] = None,
     patch_size: Optional[Sequence[int]] = None,
+    use_manifest_patch_size: bool = True,
     configuration: Optional[str] = None,
     split: Optional[str] = None,
     transform: Optional[Callable[[Dict], Dict]] = None,
@@ -1378,9 +1458,9 @@ def load_preprocessed_dataset(
     if effective_configuration is not None and effective_configuration not in manifest_configurations:
         _fail_validation(f"Requested configuration '{effective_configuration}' is not present in the manifest")
     effective_patch_size = patch_size
-    if effective_patch_size is None and effective_configuration is not None:
+    if use_manifest_patch_size and effective_patch_size is None and effective_configuration is not None:
         effective_patch_size = manifest_configurations.get(effective_configuration, {}).get("patch_size")
-    if effective_patch_size is None:
+    if use_manifest_patch_size and effective_patch_size is None:
         effective_patch_size = manifest_patch_size
     task_mode = manifest["task_mode"]
     run_stage = manifest["run_stage"]
@@ -1417,6 +1497,7 @@ def load_preprocessed_dataset(
         identifiers = splits[split]
     common_kwargs: Dict[str, Any] = {
         "folder": folder,
+        "extra_folder": extra_folder,
         "identifiers": identifiers,
         "patch_size": effective_patch_size,
         "transform": transform,
