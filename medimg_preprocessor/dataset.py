@@ -600,7 +600,7 @@ def _load_conflict_map(extra_folder: str | None, identifier: str, storage_format
     return None
 
 
-@lru_cache(maxsize=512)
+@lru_cache(maxsize=2)
 def _load_preprocessed_case_cached(folder: str, identifier: str, extra_folder: str | None = None) -> dict:
     if not os.path.isdir(folder):
         _fail_validation(f"Preprocessed case folder does not exist: {folder}")
