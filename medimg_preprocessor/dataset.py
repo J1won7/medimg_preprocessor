@@ -600,6 +600,23 @@ def _load_conflict_map(extra_folder: str | None, identifier: str, storage_format
     return None
 
 
+def _quantize_conflict_map(array: np.ndarray) -> np.ndarray:
+    array = np.asarray(array, dtype=np.float32)
+    return np.rint(array.clip(0.0, 1.0) * 255.0).astype(np.uint8, copy=False)
+
+
+def _dequantize_conflict_map(array: np.ndarray) -> np.ndarray:
+    array = np.asarray(array)
+    if np.issubdtype(array.dtype, np.floating):
+        return array.astype(np.float32, copy=False)
+    if np.issubdtype(array.dtype, np.integer):
+        max_value = float(np.iinfo(array.dtype).max)
+        if max_value <= 0.0:
+            return np.zeros_like(array, dtype=np.float32)
+        return array.astype(np.float32) / max_value
+    return array.astype(np.float32)
+
+
 @lru_cache(maxsize=2)
 def _load_preprocessed_case_cached(folder: str, identifier: str, extra_folder: str | None = None) -> dict:
     if not os.path.isdir(folder):
@@ -717,6 +734,7 @@ def save_preprocessed_conflict_map(
         _fail_validation(
             f"conflict_map for case '{identifier}' must match image shape {expected_shape}, got {tuple(array.shape)}"
         )
+    array = _quantize_conflict_map(array)
     target_folder = extra_folder if extra_folder is not None else folder
     os.makedirs(target_folder, exist_ok=True)
     storage_format = case.get("storage_format", DEFAULT_STORAGE_FORMAT)
@@ -1311,7 +1329,7 @@ class TaskPreprocessedDataset(Dataset):
         if stored_mask is not None:
             sample["mask"] = torch.from_numpy(np.asarray(stored_mask != 0)).bool()
         if conflict_map is not None:
-            sample["conflict_map"] = torch.from_numpy(np.asarray(conflict_map)).float()
+            sample["conflict_map"] = torch.from_numpy(_dequantize_conflict_map(conflict_map)).float()
         if self.transform is not None:
             sample = self.transform(sample)
         return sample

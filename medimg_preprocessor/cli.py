@@ -477,6 +477,41 @@ def _override_normalization_config(
     )
 
 
+def _override_resampling_config(
+    config: Optional[PreprocessingConfig],
+    *,
+    label_order: Optional[int],
+    label_order_z: Optional[int],
+) -> Optional[PreprocessingConfig]:
+    if config is None:
+        return None
+    if label_order is None and label_order_z is None:
+        return config
+
+    next_label_order = config.resampling.label_order if label_order is None else int(label_order)
+    next_label_order_z = config.resampling.label_order_z if label_order_z is None else int(label_order_z)
+    if next_label_order < 0 or next_label_order_z < 0:
+        raise ValueError("--label-order and --label-order-z must be non-negative")
+
+    return PreprocessingConfig(
+        spacing=config.spacing,
+        transpose_forward=config.transpose_forward,
+        normalization_schemes=config.normalization_schemes,
+        use_mask_for_norm=config.use_mask_for_norm,
+        foreground_intensity_properties_per_channel={
+            str(k): dict(v) for k, v in config.foreground_intensity_properties_per_channel.items()
+        },
+        resampling=ResamplingConfig(
+            image_order=config.resampling.image_order,
+            image_order_z=config.resampling.image_order_z,
+            label_order=next_label_order,
+            label_order_z=next_label_order_z,
+            force_separate_z=config.resampling.force_separate_z,
+            separate_z_anisotropy_threshold=config.resampling.separate_z_anisotropy_threshold,
+        ),
+    )
+
+
 def _resolve_default_configuration(configurations: Optional[dict]) -> Optional[str]:
     if not configurations:
         return None
@@ -1074,11 +1109,21 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
             normalization_min=args.normalization_min,
             normalization_max=args.normalization_max,
         )
+        config_a = _override_resampling_config(
+            config_a,
+            label_order=args.label_order,
+            label_order_z=args.label_order_z,
+        )
         config_b = _override_normalization_config(
             config_b,
             method=args.normalization_method,
             normalization_min=args.normalization_min,
             normalization_max=args.normalization_max,
+        )
+        config_b = _override_resampling_config(
+            config_b,
+            label_order=args.label_order,
+            label_order_z=args.label_order_z,
         )
         _log_normalization_summary(
             "domain_a",
@@ -1148,6 +1193,11 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                 normalization_min=args.normalization_min,
                 normalization_max=args.normalization_max,
             )
+            base_config = _override_resampling_config(
+                base_config,
+                label_order=args.label_order,
+                label_order_z=args.label_order_z,
+            )
             _log_normalization_summary(
                 "image",
                 base_config,
@@ -1199,6 +1249,11 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                 method=args.normalization_method,
                 normalization_min=args.normalization_min,
                 normalization_max=args.normalization_max,
+            )
+            base_config = _override_resampling_config(
+                base_config,
+                label_order=args.label_order,
+                label_order_z=args.label_order_z,
             )
             _log_normalization_summary(
                 "source",
@@ -1549,6 +1604,25 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Upper bound used by MinMaxClipNormalization. Requires --normalization-method MinMaxClipNormalization.",
+    )
+    preprocess_parser.add_argument(
+        "--label-order",
+        type=int,
+        default=None,
+        help=(
+            "Override the segmentation-label resampling order. "
+            "0 keeps nearest-neighbor style label preservation. "
+            "1 resizes each label mask separately and can smooth boundaries."
+        ),
+    )
+    preprocess_parser.add_argument(
+        "--label-order-z",
+        type=int,
+        default=None,
+        help=(
+            "Override the z-axis segmentation-label resampling order when separate-z resampling is used. "
+            "0 is the safest choice for label-id preservation."
+        ),
     )
 
     preprocess_parser.set_defaults(func=_preprocess_dataset_command)

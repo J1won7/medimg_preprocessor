@@ -255,6 +255,35 @@ You can let the tool plan preprocessing automatically, or provide a config/plans
 - `--configuration-name`
   - select a configuration inside the plans file
 
+### Label resampling override
+
+If you want to keep automatic planning or nnU-Net plans but force a safer label interpolation mode,
+you can override the segmentation label resampling order directly from the CLI.
+
+- `--label-order 0`
+  - nearest-neighbor style label resampling
+  - safest option when label IDs must be preserved exactly
+  - usually preferred for instance IDs or very small structures
+
+- `--label-order 1`
+  - resizes each label mask separately and then reconstructs the label map
+  - can make boundaries a bit smoother
+  - may alter thin structures or tightly packed instances
+
+- `--label-order-z 0`
+  - same idea, but only for the separate-z pass used on anisotropic volumes
+
+Example:
+
+```bash
+python -m medimg_preprocessor preprocess-dataset \
+  --task-mode segmentation \
+  --images-dir raw/imagesTr \
+  --target-dir raw/labelsTr \
+  --output-folder preprocessed_seg \
+  --label-order 0
+```
+
 ### Normalization
 
 Useful normalization options:
