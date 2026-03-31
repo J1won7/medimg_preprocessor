@@ -220,6 +220,12 @@ def _save_blosc2_array(array: np.ndarray, filename: str, patch_size: Optional[Se
     blosc2.asarray(np.ascontiguousarray(array), urlpath=filename, chunks=chunks, blocks=blocks, cparams=cparams)
 
 
+def _should_save_mask(case: TaskPreprocessedCase, save_mask: Optional[bool]) -> bool:
+    if save_mask is not None:
+        return bool(save_mask)
+    return not (case.task_mode == TaskMode.SEGMENTATION and case.run_stage == RunStage.TRAIN)
+
+
 def save_preprocessed_case(
     case: TaskPreprocessedCase,
     output_filename_truncated: str,
@@ -231,6 +237,7 @@ def save_preprocessed_case(
     patch_sampling_min_fraction: float = 0.0,
     patch_sampling_source: str = "image",
     patch_sampling_max_starts: int = 8192,
+    save_mask: Optional[bool] = None,
 ) -> None:
     if not isinstance(case, TaskPreprocessedCase):
         _fail_validation(f"case must be a TaskPreprocessedCase, got {type(case).__name__}")
@@ -254,13 +261,14 @@ def save_preprocessed_case(
             "case.evaluation_reference spatial shape must match image, "
             f"got {case.evaluation_reference.shape[1:]} and {case.image.shape[1:]}"
         )
-    stored_mask = case.mask if case.mask is not None else case.patch_sampling_mask
-    if stored_mask is not None:
-        stored_mask = np.asarray(stored_mask)
-        if tuple(stored_mask.shape) != tuple(case.image.shape[1:]):
+    sampling_mask = case.mask if case.mask is not None else case.patch_sampling_mask
+    if sampling_mask is not None:
+        sampling_mask = np.asarray(sampling_mask)
+        if tuple(sampling_mask.shape) != tuple(case.image.shape[1:]):
             _fail_validation(
-                f"case.mask spatial shape must match image, got {stored_mask.shape} and {case.image.shape[1:]}"
+                f"case.mask spatial shape must match image, got {sampling_mask.shape} and {case.image.shape[1:]}"
             )
+    stored_mask = sampling_mask if _should_save_mask(case, save_mask) else None
     storage_format = _validate_storage_format(storage_format)
     if storage_format == "npz":
         arrays = {"image": np.ascontiguousarray(case.image)}
@@ -300,10 +308,10 @@ def save_preprocessed_case(
         "reference_type": case.reference_type,
         "storage_format": storage_format,
         "mask_locations": _sample_mask_locations(
-            stored_mask,
+            sampling_mask,
             max_samples=int(patch_sampling_max_starts),
         )
-        if stored_mask is not None
+        if sampling_mask is not None
         else None,
         "patch_sampling": None,
     }

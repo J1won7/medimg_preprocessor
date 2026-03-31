@@ -273,6 +273,26 @@ you can override the segmentation label resampling order directly from the CLI.
 - `--label-order-z 0`
   - same idea, but only for the separate-z pass used on anisotropic volumes
 
+### Stored mask files
+
+The saved `_mask` file is a stored sampling mask. It is not the same thing as
+`use_mask_for_norm` in the normalization config.
+
+- `--save-mask`
+  - force writing the derived sampling mask to disk
+
+- `--no-save-mask`
+  - skip writing the `_mask` file
+
+Default behavior:
+
+- `segmentation` with `train`
+  - `_mask` file is not written by default
+  - patch sampling still uses label-derived foreground locations
+
+- other modes or stages
+  - `_mask` file is written by default, as before
+
 Example:
 
 ```bash
@@ -281,7 +301,8 @@ python -m medimg_preprocessor preprocess-dataset \
   --images-dir raw/imagesTr \
   --target-dir raw/labelsTr \
   --output-folder preprocessed_seg \
-  --label-order 0
+  --label-order 0 \
+  --no-save-mask
 ```
 
 ### Normalization

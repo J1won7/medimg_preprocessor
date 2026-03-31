@@ -673,6 +673,7 @@ def _preprocess_case(
     patch_sampling_patch_sizes: Optional[dict[str, tuple[int, ...]]] = None,
     patch_sampling_min_fraction: float = 0.0,
     patch_sampling_max_starts: int = 8192,
+    save_mask: Optional[bool] = None,
     image_mask_files: Optional[list[str] | str] = None,
     target_mask_files: Optional[list[str] | str] = None,
     mask_reader_name: Optional[str] = None,
@@ -728,6 +729,7 @@ def _preprocess_case(
         patch_sampling_patch_sizes=patch_sampling_patch_sizes,
         patch_sampling_min_fraction=patch_sampling_min_fraction,
         patch_sampling_max_starts=patch_sampling_max_starts,
+        save_mask=save_mask,
     )
 
 
@@ -781,6 +783,7 @@ def _preprocess_segmentation_or_self_supervised(
                 "patch_sampling_patch_sizes": patch_sampling_patch_sizes,
                 "patch_sampling_min_fraction": args.patch_mask_min_fraction,
                 "patch_sampling_max_starts": args.patch_mask_max_starts,
+                "save_mask": args.save_mask,
                 "image_mask_files": None if image_masks is None else image_masks[identifier][0],
                 "mask_reader_name": args.mask_reader,
                 "mask_mode": args.masking_mode,
@@ -839,6 +842,7 @@ def _preprocess_segmentation_or_self_supervised(
             "patch_sampling_patch_sizes": patch_sampling_patch_sizes,
             "patch_sampling_min_fraction": args.patch_mask_min_fraction,
             "patch_sampling_max_starts": args.patch_mask_max_starts,
+            "save_mask": args.save_mask,
             "mask_mode": None,
         }
         for identifier in identifiers
@@ -913,6 +917,7 @@ def _preprocess_paired(
             "patch_sampling_patch_sizes": patch_sampling_patch_sizes,
             "patch_sampling_min_fraction": args.patch_mask_min_fraction,
             "patch_sampling_max_starts": args.patch_mask_max_starts,
+            "save_mask": args.save_mask,
             "image_mask_files": None if source_masks is None else source_masks[identifier][0],
             "target_mask_files": None if target_masks is None else target_masks[identifier][0],
             "mask_reader_name": args.mask_reader,
@@ -991,6 +996,7 @@ def _preprocess_unpaired(
             "patch_sampling_patch_sizes": patch_sampling_patch_sizes,
             "patch_sampling_min_fraction": args.patch_mask_min_fraction,
             "patch_sampling_max_starts": args.patch_mask_max_starts,
+            "save_mask": args.save_mask,
             "image_mask_files": None if masks_a is None else masks_a[identifier][0],
             "target_mask_files": None,
             "mask_reader_name": args.mask_reader,
@@ -1018,6 +1024,7 @@ def _preprocess_unpaired(
             "patch_sampling_patch_sizes": patch_sampling_patch_sizes,
             "patch_sampling_min_fraction": args.patch_mask_min_fraction,
             "patch_sampling_max_starts": args.patch_mask_max_starts,
+            "save_mask": args.save_mask,
             "image_mask_files": None if masks_b is None else masks_b[identifier][0],
             "target_mask_files": None,
             "mask_reader_name": args.mask_reader,
@@ -1622,6 +1629,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Override the z-axis segmentation-label resampling order when separate-z resampling is used. "
             "0 is the safest choice for label-id preservation."
+        ),
+    )
+    preprocess_parser.add_argument(
+        "--save-mask",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Store the derived sampling mask as a separate case file. "
+            "By default this is disabled for segmentation train and enabled for other modes/stages."
         ),
     )
 
