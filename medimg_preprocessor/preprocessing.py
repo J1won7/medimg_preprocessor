@@ -11,7 +11,6 @@ from .geometry import (
     compute_new_shape,
     create_nonzero_mask,
     create_threshold_mask,
-    crop_to_nonzero,
     ensure_binary_mask,
     postprocess_binary_mask,
     resample_array,
@@ -41,13 +40,10 @@ class RunStage:
 class ModularPreprocessingSettings:
     mode: str = PreprocessingMode.SEGMENTATION
     transpose: bool = True
-    crop_to_nonzero: bool = True
     normalize: bool = True
     resample: bool = True
     keep_target: Optional[bool] = None
-    keep_nonzero_mask: bool = False
     collect_foreground_locations: Optional[bool] = None
-    use_nonzero_mask_for_norm_if_no_target: bool = True
 
     @classmethod
     def segmentation_defaults(cls) -> "ModularPreprocessingSettings":
@@ -293,24 +289,11 @@ class ModularPreprocessor:
                 sampling_mask = sampling_mask.transpose(self.config.transpose_forward)
             spacing = [spacing[i] for i in self.config.transpose_forward]
         properties["spacing_after_transpose"] = spacing
-        properties["shape_before_cropping"] = tuple(int(i) for i in image.shape[1:])
+        properties["shape_before_resampling"] = tuple(int(i) for i in image.shape[1:])
 
         mask = None
-        if settings.crop_to_nonzero:
-            image, cropped_reference, bbox = crop_to_nonzero(image, target)
-            properties["bbox_used_for_cropping"] = bbox
-            if target is None:
-                mask = cropped_reference[0] >= 0
-            else:
-                target = cropped_reference
-                mask = target[0] >= 0
-            if sampling_mask is not None:
-                sampling_mask = sampling_mask[tuple(slice(int(b[0]), int(b[1])) for b in bbox)]
-        else:
-            properties["bbox_used_for_cropping"] = None
-            if settings.keep_nonzero_mask or (settings.normalize and any(self.config.use_mask_for_norm)):
-                mask = create_nonzero_mask(image)
-        properties["shape_after_cropping_and_before_resampling"] = image.shape[1:]
+        if settings.normalize and any(self.config.use_mask_for_norm):
+            mask = create_nonzero_mask(image)
 
         patch_sampling_image = image.copy()
         patch_sampling_target = None if target is None else target.copy()
@@ -321,8 +304,6 @@ class ModularPreprocessor:
         )
 
         if settings.normalize:
-            if mask is None and settings.use_nonzero_mask_for_norm_if_no_target and any(self.config.use_mask_for_norm):
-                mask = create_nonzero_mask(image)
             image = self._normalize(image, mask, intensity_properties_per_channel)
 
         if settings.resample:
@@ -572,7 +553,6 @@ class TaskAwarePreprocessor:
             "reference image",
         )
         properties["medimg_preprocessor_settings"] = asdict(settings)
-        properties["shape_before_cropping"] = tuple(int(i) for i in image.shape[1:])
 
         if tuple(spacing) != tuple(reference_spacing):
             _fail_validation("paired_generative expects source and target images with matching spacing")
@@ -595,21 +575,11 @@ class TaskAwarePreprocessor:
                 sampling_mask = sampling_mask.transpose(self.config.transpose_forward)
             spacing = [spacing[i] for i in self.config.transpose_forward]
         properties["spacing_after_transpose"] = spacing
+        properties["shape_before_resampling"] = tuple(int(i) for i in image.shape[1:])
 
         mask = None
-        if settings.crop_to_nonzero:
-            stacked, mask_ref, bbox = crop_to_nonzero(np.vstack((image, reference)), None)
-            image = stacked[: image.shape[0]]
-            reference = stacked[image.shape[0] :]
-            mask = mask_ref[0] >= 0
-            properties["bbox_used_for_cropping"] = bbox
-            if sampling_mask is not None:
-                sampling_mask = sampling_mask[tuple(slice(int(b[0]), int(b[1])) for b in bbox)]
-        else:
-            properties["bbox_used_for_cropping"] = None
-            if settings.normalize and any(self.config.use_mask_for_norm):
-                mask = create_nonzero_mask(np.vstack((image, reference)))
-        properties["shape_after_cropping_and_before_resampling"] = image.shape[1:]
+        if settings.normalize and any(self.config.use_mask_for_norm):
+            mask = create_nonzero_mask(np.vstack((image, reference)))
 
         patch_sampling_image = image.copy()
         patch_sampling_reference = reference.copy()

@@ -9,7 +9,7 @@ import warnings
 import numpy as np
 
 from .config import PreprocessingConfig, ResamplingConfig
-from .geometry import compute_new_shape, crop_to_nonzero
+from .geometry import compute_new_shape, create_nonzero_mask
 from .normalization import (
     CTNormalization,
     NoNormalization,
@@ -340,29 +340,25 @@ def _fingerprint_case_worker(payload: dict) -> tuple[tuple[int, ...], tuple[floa
             if len(reference) != 1:
                 _fail_validation(f"Segmentation planning expects exactly one reference file per case, got {reference}")
             segmentation, _ = reader.read_seg(reference[0])
-        data_cropped, seg_cropped, _ = crop_to_nonzero(images, segmentation)
         foreground_intensities_per_channel, _ = collect_foreground_intensities(
-            seg_cropped,
-            data_cropped,
+            segmentation,
+            images,
             num_samples=num_samples,
         )
     else:
-        data_cropped, mask_reference, _ = crop_to_nonzero(images, None)
-        foreground_mask = mask_reference[0] >= 0
+        foreground_mask = create_nonzero_mask(images)
         foreground_intensities_per_channel, _ = collect_nonzero_intensities(
-            data_cropped,
+            images,
             foreground_mask,
             num_samples=num_samples,
         )
 
-    shape_before_crop = images.shape[1:]
-    shape_after_crop = data_cropped.shape[1:]
-    relative_size_after_cropping = np.prod(shape_after_crop) / np.prod(shape_before_crop)
+    shape = images.shape[1:]
     return (
-        tuple(int(i) for i in shape_after_crop),
+        tuple(int(i) for i in shape),
         tuple(float(i) for i in spacing),
         foreground_intensities_per_channel,
-        float(relative_size_after_cropping),
+        1.0,
     )
 
 
@@ -397,7 +393,7 @@ def extract_fingerprint_from_cases(
     else:
         results = [_fingerprint_case_worker(payload) for payload in payloads]
 
-    shapes_after_crop = [r[0] for r in results]
+    shapes = [r[0] for r in results]
     spacings = [r[1] for r in results]
     num_channels = len(results[0][2])
     stacked_intensities = [np.concatenate([r[2][i] for r in results]) for i in range(num_channels)]
@@ -437,9 +433,9 @@ def extract_fingerprint_from_cases(
 
     return {
         "spacings": spacings,
-        "shapes_after_crop": shapes_after_crop,
+        "shapes": shapes,
         "foreground_intensity_properties_per_channel": intensity_statistics_per_channel,
-        "median_relative_size_after_cropping": float(np.median([r[3] for r in results], 0)),
+        "median_relative_size": float(np.median([r[3] for r in results], 0)),
     }
 
 
@@ -453,7 +449,7 @@ def determine_fullres_target_spacing(
         return np.array(overwrite_target_spacing, dtype=np.float64)
 
     spacings = np.vstack(fingerprint["spacings"])
-    sizes = fingerprint["shapes_after_crop"]
+    sizes = fingerprint["shapes"]
     target = np.percentile(spacings, 50, 0)
 
     if len(target) != 3:
@@ -502,7 +498,7 @@ def determine_normalization_scheme_and_mask(
     channel_names = _get_channel_names(dataset_json, num_channels)
     normalization_schemes = [_get_normalization_scheme_name(channel_name) for channel_name in channel_names]
 
-    if fingerprint["median_relative_size_after_cropping"] < (3 / 4.0):
+    if fingerprint["median_relative_size"] < (3 / 4.0):
         use_nonzero_mask_for_norm = [
             _CHANNEL_NAME_TO_NORMALIZATION.get(channel_name.casefold(), ZScoreNormalization)
             .leaves_pixels_outside_mask_at_zero_if_use_mask_for_norm_is_true
@@ -521,14 +517,14 @@ def _build_configurations(
     target_spacing: Sequence[float],
 ) -> dict[str, PlanningConfiguration]:
     new_shapes = [
-        compute_new_shape(shape_after_crop, spacing, target_spacing)
-        for spacing, shape_after_crop in zip(fingerprint["spacings"], fingerprint["shapes_after_crop"])
+        compute_new_shape(shape, spacing, target_spacing)
+        for spacing, shape in zip(fingerprint["spacings"], fingerprint["shapes"])
     ]
     new_median_shape = np.median(np.vstack(new_shapes), 0)
     new_median_shape_transposed = new_median_shape[np.asarray(transpose_forward)]
     fullres_spacing_transposed = np.asarray(target_spacing)[np.asarray(transpose_forward)]
     approximate_n_voxels_dataset = float(
-        np.prod(new_median_shape_transposed, dtype=np.float64) * len(fingerprint["shapes_after_crop"])
+        np.prod(new_median_shape_transposed, dtype=np.float64) * len(fingerprint["shapes"])
     )
 
     configurations: dict[str, PlanningConfiguration] = {}

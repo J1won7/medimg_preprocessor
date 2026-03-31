@@ -165,10 +165,6 @@ def _compute_patch_starts(spatial_shape: Sequence[int], patch_size: Sequence[int
     return [tuple(int(axis_values[idx]) for axis_values, idx in zip(axes, indices)) for indices in np.ndindex(*(len(a) for a in axes))]
 
 
-def _bbox_slices(bbox: Sequence[Sequence[int]]) -> tuple[slice, ...]:
-    return tuple(slice(int(bounds[0]), int(bounds[1])) for bounds in bbox)
-
-
 def _inverse_normalize_channel(image: np.ndarray, scheme: str, stats: dict) -> np.ndarray:
     eps = 1e-8
     image = image.astype(np.float32, copy=False)
@@ -205,10 +201,10 @@ def _undo_preprocessing(pred: np.ndarray, properties: Dict[str, Any], config: Pr
     settings = properties.get("medimg_preprocessor_settings", {})
 
     if settings.get("resample", True):
-        cropped_shape = tuple(int(i) for i in properties["shape_after_cropping_and_before_resampling"])
+        shape_before_resampling = tuple(int(i) for i in properties["shape_before_resampling"])
         restored = resample_array(
             restored,
-            cropped_shape,
+            shape_before_resampling,
             properties["spacing_after_resampling"],
             properties["spacing_after_transpose"],
             is_seg=False,
@@ -217,13 +213,6 @@ def _undo_preprocessing(pred: np.ndarray, properties: Dict[str, Any], config: Pr
             force_separate_z=config.resampling.force_separate_z,
             separate_z_anisotropy_threshold=config.resampling.separate_z_anisotropy_threshold,
         )
-
-    if settings.get("crop_to_nonzero", True) and properties.get("bbox_used_for_cropping") is not None:
-        shape_before_cropping = tuple(int(i) for i in properties["shape_before_cropping"])
-        transposed_shape = tuple(shape_before_cropping[i] for i in config.transpose_forward)
-        full = np.zeros((restored.shape[0], *transposed_shape), dtype=restored.dtype)
-        full[(slice(None),) + _bbox_slices(properties["bbox_used_for_cropping"])] = restored
-        restored = full
 
     if settings.get("transpose", True):
         inverse_axes = np.argsort(np.asarray(config.transpose_forward))

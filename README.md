@@ -131,6 +131,14 @@ python -m medimg_preprocessor preprocess-dataset \
   - output array format
   - usually `blosc2` or `npz`
 
+### Cropping behavior
+
+The preprocessor no longer applies nnU-Net-style nonzero cropping during preprocessing.
+
+- image and target arrays keep their original spatial extent until resampling
+- segmentation labels are not rewritten to `-1` outside an image-derived crop box
+- saved label semantics stay closer to the original dataset
+
 ### Masking
 
 Patch sampling is based on the saved mask when a mask is available.

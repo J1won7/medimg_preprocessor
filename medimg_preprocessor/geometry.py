@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from copy import deepcopy
-from typing import List, Sequence, Tuple
+from typing import Sequence
 import warnings
 
 import numpy as np
@@ -80,38 +80,6 @@ def postprocess_binary_mask(
     if fill_holes:
         mask = binary_fill_holes(mask)
     return np.asarray(mask, dtype=bool)
-
-
-def get_bbox_from_mask(mask: np.ndarray) -> List[List[int]]:
-    coords = np.where(mask)
-    if len(coords[0]) == 0:
-        return [[0, int(i)] for i in mask.shape]
-    return [[int(c.min()), int(c.max()) + 1] for c in coords]
-
-
-def bbox_to_slices(bbox: Sequence[Sequence[int]]) -> Tuple[slice, ...]:
-    return tuple(slice(int(b[0]), int(b[1])) for b in bbox)
-
-
-def crop_to_nonzero(
-    data: np.ndarray,
-    reference: np.ndarray | None = None,
-    outside_value: int = -1,
-) -> tuple[np.ndarray, np.ndarray, List[List[int]]]:
-    mask = create_nonzero_mask(data)
-    bbox = get_bbox_from_mask(mask)
-    mask = mask[bbox_to_slices(bbox)][None]
-    slicer = (slice(None),) + bbox_to_slices(bbox)
-    data = data[slicer]
-    if reference is None:
-        reference = np.where(mask, np.int8(0), np.int8(outside_value))
-    else:
-        reference = reference[slicer]
-        if np.issubdtype(reference.dtype, np.unsignedinteger):
-            reference = reference.astype(np.int16, copy=False)
-        reference[(reference == 0) & (~mask)] = outside_value
-    return data, reference, bbox
-
 
 def compute_new_shape(
     old_shape: Sequence[int],
