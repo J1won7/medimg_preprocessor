@@ -845,53 +845,52 @@ class TaskAwarePreprocessor:
 
         sampling_mask = None
         sampling_mask_properties = None
-        if task_mode == TaskMode.SEGMENTATION and reference is not None:
+        candidate_masks: list[np.ndarray] = []
+        if image_mask_files is not None:
+            reader = mask_reader or image_reader
+            if isinstance(image_mask_files, str):
+                if not hasattr(reader, "read_seg"):
+                    _fail_validation("mask_reader must provide read_seg(mask_fname) for string image mask files")
+                mask_array, _ = reader.read_seg(image_mask_files)
+            else:
+                if not hasattr(reader, "read_images"):
+                    _fail_validation("mask_reader must provide read_images(image_fnames) for sequence image mask files")
+                mask_array, _ = reader.read_images(tuple(image_mask_files))
+            candidate_masks.append(
+                ensure_binary_mask(mask_array, spatial_shape=image.shape[1:], name="image sampling mask")
+            )
+        if target_mask_files is not None:
+            if reference is None:
+                _fail_validation("target_mask_files requires a target/reference image")
+            reader = mask_reader or reference_reader or image_reader
+            if isinstance(target_mask_files, str):
+                if not hasattr(reader, "read_seg"):
+                    _fail_validation("mask_reader must provide read_seg(mask_fname) for string target mask files")
+                mask_array, _ = reader.read_seg(target_mask_files)
+            else:
+                if not hasattr(reader, "read_images"):
+                    _fail_validation("mask_reader must provide read_images(image_fnames) for sequence target mask files")
+                mask_array, _ = reader.read_images(tuple(target_mask_files))
+            candidate_masks.append(
+                ensure_binary_mask(mask_array, spatial_shape=image.shape[1:], name="target sampling mask")
+            )
+        if mask_mode == "threshold":
+            if image_mask_threshold is None and target_mask_threshold is None:
+                _fail_validation("mask_mode='threshold' requires at least one of image_mask_threshold or target_mask_threshold")
+            if image_mask_threshold is not None:
+                candidate_masks.append(create_threshold_mask(image, float(image_mask_threshold)))
+            if target_mask_threshold is not None:
+                if reference is None:
+                    _fail_validation("target_mask_threshold requires a target/reference image")
+                candidate_masks.append(create_threshold_mask(reference, float(target_mask_threshold)))
+        if candidate_masks:
+            sampling_mask = np.zeros(image.shape[1:], dtype=bool)
+            for candidate in candidate_masks:
+                sampling_mask |= np.asarray(candidate).astype(bool)
+            sampling_mask_properties = image_properties
+        elif task_mode == TaskMode.SEGMENTATION and reference is not None:
             sampling_mask = ensure_binary_mask(reference, spatial_shape=image.shape[1:], name="segmentation reference mask")
             sampling_mask_properties = reference_properties
-        else:
-            candidate_masks: list[np.ndarray] = []
-            if image_mask_files is not None:
-                reader = mask_reader or image_reader
-                if isinstance(image_mask_files, str):
-                    if not hasattr(reader, "read_seg"):
-                        _fail_validation("mask_reader must provide read_seg(mask_fname) for string image mask files")
-                    mask_array, _ = reader.read_seg(image_mask_files)
-                else:
-                    if not hasattr(reader, "read_images"):
-                        _fail_validation("mask_reader must provide read_images(image_fnames) for sequence image mask files")
-                    mask_array, _ = reader.read_images(tuple(image_mask_files))
-                candidate_masks.append(
-                    ensure_binary_mask(mask_array, spatial_shape=image.shape[1:], name="image sampling mask")
-                )
-            if target_mask_files is not None:
-                if reference is None:
-                    _fail_validation("target_mask_files requires a target/reference image")
-                reader = mask_reader or reference_reader or image_reader
-                if isinstance(target_mask_files, str):
-                    if not hasattr(reader, "read_seg"):
-                        _fail_validation("mask_reader must provide read_seg(mask_fname) for string target mask files")
-                    mask_array, _ = reader.read_seg(target_mask_files)
-                else:
-                    if not hasattr(reader, "read_images"):
-                        _fail_validation("mask_reader must provide read_images(image_fnames) for sequence target mask files")
-                    mask_array, _ = reader.read_images(tuple(target_mask_files))
-                candidate_masks.append(
-                    ensure_binary_mask(mask_array, spatial_shape=image.shape[1:], name="target sampling mask")
-                )
-            if mask_mode == "threshold":
-                if image_mask_threshold is None and target_mask_threshold is None:
-                    _fail_validation("mask_mode='threshold' requires at least one of image_mask_threshold or target_mask_threshold")
-                if image_mask_threshold is not None:
-                    candidate_masks.append(create_threshold_mask(image, float(image_mask_threshold)))
-                if target_mask_threshold is not None:
-                    if reference is None:
-                        _fail_validation("target_mask_threshold requires a target/reference image")
-                    candidate_masks.append(create_threshold_mask(reference, float(target_mask_threshold)))
-            if candidate_masks:
-                sampling_mask = np.zeros(image.shape[1:], dtype=bool)
-                for candidate in candidate_masks:
-                    sampling_mask |= np.asarray(candidate).astype(bool)
-                sampling_mask_properties = image_properties
 
         if sampling_mask is not None:
             sampling_mask = postprocess_binary_mask(

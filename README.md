@@ -146,7 +146,8 @@ Patch sampling is based on the saved mask when a mask is available.
 Default behavior:
 
 - `segmentation`
-  - uses the label as the sampling mask automatically
+  - uses an external mask first when provided
+  - otherwise falls back to the label as the sampling mask automatically
 
 - other modes
   - if no mask is given, patches are sampled from the full spatial range
