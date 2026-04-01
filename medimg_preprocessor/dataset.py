@@ -805,6 +805,7 @@ def save_preprocessed_artifact_prediction(
     *,
     extra_folder: str | None = None,
     patch_size_hint: Optional[Sequence[int]] = None,
+    storage_format: Optional[str] = None,
 ) -> str:
     case = load_preprocessed_case(folder, identifier)
     array = np.asarray(artifact_prediction, dtype=np.float32)
@@ -818,13 +819,18 @@ def save_preprocessed_artifact_prediction(
         )
     target_folder = extra_folder if extra_folder is not None else folder
     os.makedirs(target_folder, exist_ok=True)
-    storage_format = case.get("storage_format", DEFAULT_STORAGE_FORMAT)
-    if storage_format == "blosc2":
+    effective_storage_format = case.get("storage_format", DEFAULT_STORAGE_FORMAT) if storage_format is None else str(storage_format).lower()
+    if effective_storage_format == "blosc2":
         output_path = os.path.join(target_folder, identifier + "_artifact.b2nd")
         _save_blosc2_array(np.ascontiguousarray(array), output_path, patch_size_hint)
-    else:
+    elif effective_storage_format == "npy":
         output_path = os.path.join(target_folder, identifier + "_artifact.npy")
         np.save(output_path, np.ascontiguousarray(array))
+    elif effective_storage_format == "npz":
+        output_path = os.path.join(target_folder, identifier + "_artifact.npz")
+        np.savez_compressed(output_path, artifact_prediction=np.ascontiguousarray(array))
+    else:
+        _fail_validation(f"Unsupported artifact prediction storage format '{effective_storage_format}'")
     return output_path
 
 
