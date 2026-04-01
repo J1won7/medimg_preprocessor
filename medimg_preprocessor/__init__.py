@@ -68,6 +68,7 @@ try:
         save_preprocessed_dataset_manifest,
         save_preprocessed_case,
         save_preprocessed_conflict_map,
+        save_preprocessed_artifact_prediction,
         save_unpaired_preprocessed_dataset_manifest,
     )
 except ModuleNotFoundError as e:
@@ -134,6 +135,7 @@ _dataset_exports = [
     "save_preprocessed_dataset_manifest",
     "save_preprocessed_case",
     "save_preprocessed_conflict_map",
+    "save_preprocessed_artifact_prediction",
     "save_unpaired_preprocessed_dataset_manifest",
 ]
 

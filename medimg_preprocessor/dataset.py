@@ -608,6 +608,33 @@ def _load_conflict_map(extra_folder: str | None, identifier: str, storage_format
     return None
 
 
+def _load_artifact_prediction(extra_folder: str | None, identifier: str, storage_format: str):
+    if extra_folder is None:
+        return None
+    b2nd_file = os.path.join(extra_folder, identifier + "_artifact.b2nd")
+    npy_file = os.path.join(extra_folder, identifier + "_artifact.npy")
+    npz_file = os.path.join(extra_folder, identifier + "_artifact.npz")
+
+    if storage_format == "blosc2" and os.path.isfile(b2nd_file):
+        _require_blosc2()
+        blosc2.set_nthreads(1)
+        dparams = {"nthreads": 1}
+        mmap_kwargs = {} if os.name == "nt" else {"mmap_mode": "r"}
+        return blosc2.open(urlpath=b2nd_file, mode="r", dparams=dparams, **mmap_kwargs)
+    if os.path.isfile(npy_file):
+        return np.load(npy_file, mmap_mode="r")
+    if os.path.isfile(npz_file):
+        with np.load(npz_file) as arrays:
+            key = "artifact_prediction" if "artifact_prediction" in arrays.files else "artifact_pred"
+            if key not in arrays.files:
+                _fail_validation(
+                    f"Artifact prediction file for case '{identifier}' must contain an "
+                    f"'artifact_prediction' or 'artifact_pred' array"
+                )
+            return arrays[key]
+    return None
+
+
 def _quantize_conflict_map(array: np.ndarray) -> np.ndarray:
     array = np.asarray(array, dtype=np.float32)
     return np.rint(array.clip(0.0, 1.0) * 255.0).astype(np.uint8, copy=False)
@@ -660,17 +687,20 @@ def _load_preprocessed_case_cached(folder: str, identifier: str, extra_folder: s
         )
         mask = blosc2.open(urlpath=b2nd_mask_file, mode="r", dparams=dparams, **mmap_kwargs) if os.path.isfile(b2nd_mask_file) else None
         conflict_map = _load_conflict_map(extra_folder, identifier, storage_format)
+        artifact_prediction = _load_artifact_prediction(extra_folder, identifier, storage_format)
         case = {
             "image": image,
             "target": target,
             "evaluation_reference": evaluation_reference,
             "mask": None if mask is None else mask[0],
             "conflict_map": None if conflict_map is None else conflict_map,
+            "artifact_prediction": None if artifact_prediction is None else artifact_prediction,
             **meta,
         }
     else:
         with np.load(npz_file) as arrays:
             conflict_map = _load_conflict_map(extra_folder, identifier, storage_format)
+            artifact_prediction = _load_artifact_prediction(extra_folder, identifier, storage_format)
             if "image" not in arrays.files:
                 _fail_validation(f"Preprocessed case '{identifier}' does not contain an 'image' array")
             case = {
@@ -681,6 +711,7 @@ def _load_preprocessed_case_cached(folder: str, identifier: str, extra_folder: s
                 else None,
                 "mask": arrays["mask"] if "mask" in arrays.files else None,
                 "conflict_map": None if conflict_map is None else conflict_map,
+                "artifact_prediction": None if artifact_prediction is None else artifact_prediction,
                 **meta,
             }
     if "properties" not in case or not isinstance(case["properties"], dict):
@@ -714,6 +745,18 @@ def _load_preprocessed_case_cached(folder: str, identifier: str, extra_folder: s
             _fail_validation(
                 f"Preprocessed case '{identifier}' has mismatched image/conflict_map shapes: "
                 f"{expected_shape} vs {tuple(conflict_map.shape)}"
+            )
+    if case.get("artifact_prediction") is not None:
+        artifact_prediction = case["artifact_prediction"]
+        expected_shape = tuple(case["image"].shape)
+        expected_spatial = tuple(case["image"].shape[1:])
+        if tuple(artifact_prediction.shape) == expected_spatial:
+            case["artifact_prediction"] = np.asarray(artifact_prediction)[None]
+            artifact_prediction = case["artifact_prediction"]
+        if tuple(artifact_prediction.shape) != expected_shape:
+            _fail_validation(
+                f"Preprocessed case '{identifier}' has mismatched image/artifact_prediction shapes: "
+                f"{expected_shape} vs {tuple(artifact_prediction.shape)}"
             )
     if case.get("mask_locations") is None and case.get("mask") is not None:
         case["mask_locations"] = _sample_mask_locations(np.asarray(case["mask"]))
@@ -751,6 +794,36 @@ def save_preprocessed_conflict_map(
         _save_blosc2_array(np.ascontiguousarray(array), output_path, patch_size_hint)
     else:
         output_path = os.path.join(target_folder, identifier + "_conflict.npy")
+        np.save(output_path, np.ascontiguousarray(array))
+    return output_path
+
+
+def save_preprocessed_artifact_prediction(
+    folder: str,
+    identifier: str,
+    artifact_prediction: np.ndarray,
+    *,
+    extra_folder: str | None = None,
+    patch_size_hint: Optional[Sequence[int]] = None,
+) -> str:
+    case = load_preprocessed_case(folder, identifier)
+    array = np.asarray(artifact_prediction, dtype=np.float32)
+    if tuple(array.shape) == tuple(case["image"].shape[1:]):
+        array = array[None]
+    expected_shape = tuple(case["image"].shape)
+    if tuple(array.shape) != expected_shape:
+        _fail_validation(
+            f"artifact_prediction for case '{identifier}' must match image shape {expected_shape}, "
+            f"got {tuple(array.shape)}"
+        )
+    target_folder = extra_folder if extra_folder is not None else folder
+    os.makedirs(target_folder, exist_ok=True)
+    storage_format = case.get("storage_format", DEFAULT_STORAGE_FORMAT)
+    if storage_format == "blosc2":
+        output_path = os.path.join(target_folder, identifier + "_artifact.b2nd")
+        _save_blosc2_array(np.ascontiguousarray(array), output_path, patch_size_hint)
+    else:
+        output_path = os.path.join(target_folder, identifier + "_artifact.npy")
         np.save(output_path, np.ascontiguousarray(array))
     return output_path
 
@@ -1313,6 +1386,9 @@ class TaskPreprocessedDataset(Dataset):
         conflict_map = case.get("conflict_map")
         if conflict_map is not None and self.patch_size is not None:
             conflict_map = _crop_with_starts(conflict_map, self.patch_size, starts)
+        artifact_prediction = case.get("artifact_prediction")
+        if artifact_prediction is not None and self.patch_size is not None:
+            artifact_prediction = _crop_with_starts(artifact_prediction, self.patch_size, starts)
         sample = {
             "image": torch.from_numpy(np.asarray(image)).float(),
             "identifier": identifier,
@@ -1338,6 +1414,8 @@ class TaskPreprocessedDataset(Dataset):
             sample["mask"] = torch.from_numpy(np.asarray(stored_mask != 0)).bool()
         if conflict_map is not None:
             sample["conflict_map"] = torch.from_numpy(_dequantize_conflict_map(conflict_map)).float()
+        if artifact_prediction is not None:
+            sample["artifact_pred"] = torch.from_numpy(np.asarray(artifact_prediction)).float()
         if self.transform is not None:
             sample = self.transform(sample)
         return sample
