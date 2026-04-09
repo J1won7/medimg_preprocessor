@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from copy import deepcopy
-from typing import Sequence
+from typing import Optional, Sequence, Tuple
 import warnings
 
 import numpy as np
@@ -111,11 +111,11 @@ def get_lowres_axis(new_spacing: Sequence[float]) -> np.ndarray:
 
 
 def determine_do_sep_z_and_axis(
-    force_separate_z: bool | None,
+    force_separate_z: Optional[bool],
     current_spacing: Sequence[float],
     new_spacing: Sequence[float],
     separate_z_anisotropy_threshold: float = ANISO_THRESHOLD,
-) -> tuple[bool, int | None]:
+) -> Tuple[bool, Optional[int]]:
     if force_separate_z is not None:
         do_separate_z = bool(force_separate_z)
         axis = get_lowres_axis(current_spacing) if do_separate_z else None
@@ -172,7 +172,7 @@ def _resample_data_or_seg(
     new_shape: Sequence[int],
     *,
     is_seg: bool = False,
-    axis: int | None = None,
+    axis: Optional[int] = None,
     order: int = 3,
     do_separate_z: bool = False,
     order_z: int = 0,
@@ -265,7 +265,7 @@ def resample_array(
     is_seg: bool,
     order: int,
     order_z: int = 0,
-    force_separate_z: bool | None = None,
+    force_separate_z: Optional[bool] = None,
     separate_z_anisotropy_threshold: float = ANISO_THRESHOLD,
 ) -> np.ndarray:
     if order < 0:

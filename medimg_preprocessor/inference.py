@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import warnings
 
 import numpy as np
@@ -221,7 +221,7 @@ def _undo_preprocessing(pred: np.ndarray, properties: Dict[str, Any], config: Pr
     return restored
 
 
-def _save_nifti_like_reference(volume: np.ndarray, reference_path: str | Path, output_path: str | Path) -> None:
+def _save_nifti_like_reference(volume: np.ndarray, reference_path: Union[str, Path], output_path: Union[str, Path]) -> None:
     try:
         import nibabel as nib
     except ModuleNotFoundError:
@@ -352,7 +352,7 @@ class RawInferencePatchDataset(Dataset):
         self,
         prediction: np.ndarray,
         case_index: int,
-        output_path: str | Path,
+        output_path: Union[str, Path],
     ) -> None:
         case = self.get_case(case_index)
         restored = self.restore_prediction(prediction, case_index)

@@ -583,7 +583,7 @@ def load_preprocessed_dataset_manifest(folder: str) -> dict:
     return manifest
 
 
-def _load_conflict_map(extra_folder: str | None, identifier: str, storage_format: str):
+def _load_conflict_map(extra_folder: Optional[str], identifier: str, storage_format: str):
     if extra_folder is None:
         return None
     b2nd_conflict_file = os.path.join(extra_folder, identifier + "_conflict.b2nd")
@@ -608,7 +608,7 @@ def _load_conflict_map(extra_folder: str | None, identifier: str, storage_format
     return None
 
 
-def _load_artifact_prediction(extra_folder: str | None, identifier: str, storage_format: str):
+def _load_artifact_prediction(extra_folder: Optional[str], identifier: str, storage_format: str):
     if extra_folder is None:
         return None
     b2nd_file = os.path.join(extra_folder, identifier + "_artifact.b2nd")
@@ -653,7 +653,7 @@ def _dequantize_conflict_map(array: np.ndarray) -> np.ndarray:
 
 
 @lru_cache(maxsize=2)
-def _load_preprocessed_case_cached(folder: str, identifier: str, extra_folder: str | None = None) -> dict:
+def _load_preprocessed_case_cached(folder: str, identifier: str, extra_folder: Optional[str] = None) -> dict:
     if not os.path.isdir(folder):
         _fail_validation(f"Preprocessed case folder does not exist: {folder}")
     b2nd_image_file = os.path.join(folder, identifier + ".b2nd")
@@ -763,7 +763,7 @@ def _load_preprocessed_case_cached(folder: str, identifier: str, extra_folder: s
     return case
 
 
-def load_preprocessed_case(folder: str, identifier: str, extra_folder: str | None = None) -> dict:
+def load_preprocessed_case(folder: str, identifier: str, extra_folder: Optional[str] = None) -> dict:
     normalized_extra = None if extra_folder is None else str(extra_folder)
     return dict(_load_preprocessed_case_cached(str(folder), str(identifier), normalized_extra))
 
@@ -773,7 +773,7 @@ def save_preprocessed_conflict_map(
     identifier: str,
     conflict_map: np.ndarray,
     *,
-    extra_folder: str | None = None,
+    extra_folder: Optional[str] = None,
     patch_size_hint: Optional[Sequence[int]] = None,
 ) -> str:
     case = load_preprocessed_case(folder, identifier)
@@ -803,7 +803,7 @@ def save_preprocessed_artifact_prediction(
     identifier: str,
     artifact_prediction: np.ndarray,
     *,
-    extra_folder: str | None = None,
+    extra_folder: Optional[str] = None,
     patch_size_hint: Optional[Sequence[int]] = None,
     storage_format: Optional[str] = None,
 ) -> str:
@@ -1421,7 +1421,7 @@ class TaskPreprocessedDataset(Dataset):
         if conflict_map is not None:
             sample["conflict_map"] = torch.from_numpy(_dequantize_conflict_map(conflict_map)).float()
         if artifact_prediction is not None:
-            sample["artifact_pred"] = torch.from_numpy(np.asarray(artifact_prediction)).float()
+            sample["artifact_pred"] = torch.from_numpy(np.array(artifact_prediction, copy=True)).float()
         if self.transform is not None:
             sample = self.transform(sample)
         return sample

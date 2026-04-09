@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 import multiprocessing
-from typing import Dict, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 import warnings
 
 import numpy as np
@@ -323,7 +323,7 @@ def collect_nonzero_intensities(
     return intensities_per_channel, intensity_statistics_per_channel
 
 
-def _fingerprint_case_worker(payload: dict) -> tuple[tuple[int, ...], tuple[float, ...], list[np.ndarray], float]:
+def _fingerprint_case_worker(payload: dict) -> Tuple[Tuple[int, ...], Tuple[float, ...], List[np.ndarray], float]:
     reader_class = payload["reader_class"]
     reader = reader_class()
     identifier = payload["identifier"]
@@ -366,7 +366,7 @@ def extract_fingerprint_from_cases(
     cases: dict[str, list[str]],
     reader,
     *,
-    reference_cases: Optional[dict[str, Sequence[str] | str]] = None,
+    reference_cases: Optional[Dict[str, Union[Sequence[str], str]]] = None,
     dataset_json: Optional[dict] = None,
     num_foreground_samples_total: int = int(10e7),
     ct_clip_min: Optional[float] = None,
@@ -564,7 +564,7 @@ def plan_preprocessing_from_cases(
     reader,
     *,
     dataset_json: Optional[dict] = None,
-    reference_cases: Optional[dict[str, Sequence[str] | str]] = None,
+    reference_cases: Optional[Dict[str, Union[Sequence[str], str]]] = None,
     suppress_transpose: bool = False,
     overwrite_target_spacing: Optional[Sequence[float]] = None,
     ct_clip_min: Optional[float] = None,

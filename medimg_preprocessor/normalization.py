@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Type
+from typing import Dict, Optional, Type
 import warnings
 
 import numpy as np
@@ -10,18 +10,18 @@ class ImageNormalization:
     leaves_pixels_outside_mask_at_zero_if_use_mask_for_norm_is_true = False
     required_intensity_properties: tuple[str, ...] = ()
 
-    def __init__(self, use_mask_for_norm: bool = False, intensity_properties: dict | None = None):
+    def __init__(self, use_mask_for_norm: bool = False, intensity_properties: Optional[dict] = None):
         self.use_mask_for_norm = bool(use_mask_for_norm)
         self.intensity_properties = intensity_properties or {}
 
-    def run(self, image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    def run(self, image: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
         raise NotImplementedError
 
 
 class ZScoreNormalization(ImageNormalization):
     leaves_pixels_outside_mask_at_zero_if_use_mask_for_norm_is_true = True
 
-    def run(self, image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    def run(self, image: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
         image = image.astype(np.float32, copy=False)
         eps = 1e-8
         if self.use_mask_for_norm and mask is not None and np.any(mask):
@@ -39,7 +39,7 @@ class ZScoreNormalization(ImageNormalization):
 class CTNormalization(ImageNormalization):
     required_intensity_properties = ("percentile_00_5", "percentile_99_5", "mean", "std")
 
-    def run(self, image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    def run(self, image: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
         image = image.astype(np.float32, copy=False)
         eps = 1e-8
         lower = self.intensity_properties.get("clip_min", self.intensity_properties["percentile_00_5"])
@@ -55,7 +55,7 @@ class CTNormalization(ImageNormalization):
 class MinMaxClipNormalization(ImageNormalization):
     required_intensity_properties = ("clip_min", "clip_max")
 
-    def run(self, image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    def run(self, image: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
         image = image.astype(np.float32, copy=False)
         eps = 1e-8
         lower = self.intensity_properties["clip_min"]
@@ -75,12 +75,12 @@ class MinMaxClipNormalization(ImageNormalization):
 
 
 class NoNormalization(ImageNormalization):
-    def run(self, image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    def run(self, image: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
         return image.astype(np.float32, copy=False)
 
 
 class RescaleTo01Normalization(ImageNormalization):
-    def run(self, image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    def run(self, image: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
         image = image.astype(np.float32, copy=False)
         eps = 1e-8
         image -= image.min()
@@ -89,7 +89,7 @@ class RescaleTo01Normalization(ImageNormalization):
 
 
 class RGBTo01Normalization(ImageNormalization):
-    def run(self, image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    def run(self, image: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
         image = image.astype(np.float32, copy=False)
         image /= 255.0
         return image

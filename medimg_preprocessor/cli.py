@@ -8,7 +8,7 @@ import re
 import sys
 from time import sleep
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 from .config import PreprocessingConfig, ResamplingConfig
 from .dataset import (
@@ -217,6 +217,23 @@ def _load_config(
     if configuration_name is not None:
         raise ValueError("--configuration-name requires --plans-file")
     return None
+
+
+def _add_bool_flag(
+    parser: argparse._ActionsContainer,
+    name: str,
+    *,
+    default: bool,
+    help_text: str,
+) -> None:
+    parser.add_argument(name, dest=name[2:].replace("-", "_"), action="store_true", help=help_text)
+    parser.add_argument(
+        "--no-" + name[2:],
+        dest=name[2:].replace("-", "_"),
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.set_defaults(**{name[2:].replace("-", "_"): default})
 
 
 def _strip_known_suffix(filename: str) -> str:
@@ -665,7 +682,7 @@ def _preprocess_case(
     output_folder: Path,
     task_mode: str,
     run_stage: str,
-    reference_files: Optional[list[str] | str] = None,
+    reference_files: Optional[Union[list[str], str]] = None,
     reference_reader_name: Optional[str] = None,
     reference_dataset_json: Optional[dict] = None,
     storage_format: str = "blosc2",
@@ -674,8 +691,8 @@ def _preprocess_case(
     patch_sampling_min_fraction: float = 0.0,
     patch_sampling_max_starts: int = 8192,
     save_mask: Optional[bool] = None,
-    image_mask_files: Optional[list[str] | str] = None,
-    target_mask_files: Optional[list[str] | str] = None,
+    image_mask_files: Optional[Union[list[str], str]] = None,
+    target_mask_files: Optional[Union[list[str], str]] = None,
     mask_reader_name: Optional[str] = None,
     mask_mode: Optional[str] = None,
     image_mask_threshold: Optional[float] = None,
@@ -1542,12 +1559,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=MASK_THRESHOLD_UNSET,
         help="Threshold for generating a target-side mask. Overrides --mask-threshold for the target side. Use 'none' to disable.",
     )
-    masking_group.add_argument("--mask-fill-holes", action=argparse.BooleanOptionalAction, default=True, help="Fill holes in the generated mask. Default: true")
-    masking_group.add_argument(
-        "--mask-keep-largest-component",
-        action=argparse.BooleanOptionalAction,
+    _add_bool_flag(
+        masking_group,
+        "--mask-fill-holes",
         default=True,
-        help="Keep only the largest connected component in the generated mask. Default: true",
+        help_text="Fill holes in the generated mask. Default: true",
+    )
+    _add_bool_flag(
+        masking_group,
+        "--mask-keep-largest-component",
+        default=True,
+        help_text="Keep only the largest connected component in the generated mask. Default: true",
     )
     masking_group.add_argument("--mask-closing-iters", type=int, default=1, help="Binary closing iterations applied to generated masks. Default: 1")
     masking_group.add_argument(
@@ -1640,15 +1662,16 @@ def build_parser() -> argparse.ArgumentParser:
             "0 is the safest choice for label-id preservation."
         ),
     )
-    preprocess_parser.add_argument(
+    _add_bool_flag(
+        preprocess_parser,
         "--save-mask",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help=(
+        default=False,
+        help_text=(
             "Store the derived sampling mask as a separate case file. "
             "By default this is disabled for segmentation train and enabled for other modes/stages."
         ),
     )
+    preprocess_parser.set_defaults(save_mask=None)
 
     preprocess_parser.set_defaults(func=_preprocess_dataset_command)
 

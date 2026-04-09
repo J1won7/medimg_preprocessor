@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 import warnings
 
 import numpy as np
@@ -174,9 +174,9 @@ class ModularPreprocessor:
         self,
         image: np.ndarray,
         image_properties: dict,
-        sampling_mask: np.ndarray | None,
-        sampling_mask_properties: dict | None,
-    ) -> np.ndarray | None:
+        sampling_mask: Optional[np.ndarray],
+        sampling_mask_properties: Optional[dict],
+    ) -> Optional[np.ndarray]:
         if sampling_mask is None:
             return None
         mask = ensure_binary_mask(sampling_mask, spatial_shape=image.shape[1:], name="sampling mask")
@@ -194,7 +194,7 @@ class ModularPreprocessor:
         self,
         image: np.ndarray,
         properties: dict,
-        target: np.ndarray | None,
+        target: Optional[np.ndarray],
         target_is_segmentation: bool,
     ) -> tuple[float, ...]:
         self._validate_array(image, "image")
@@ -215,7 +215,7 @@ class ModularPreprocessor:
     def _normalize(
         self,
         image: np.ndarray,
-        mask: np.ndarray | None,
+        mask: Optional[np.ndarray],
         intensity_properties_per_channel: Optional[dict],
     ) -> np.ndarray:
         stats = intensity_properties_per_channel or self.config.foreground_intensity_properties_per_channel
@@ -241,7 +241,7 @@ class ModularPreprocessor:
     @staticmethod
     def _sample_foreground_locations(
         target: np.ndarray,
-        labels: Sequence[int] | None = None,
+        labels: Optional[Sequence[int]] = None,
         seed: int = 1234,
         max_samples: int = 10000,
     ) -> dict:
@@ -264,11 +264,11 @@ class ModularPreprocessor:
         self,
         image: np.ndarray,
         properties: dict,
-        target: np.ndarray | None = None,
+        target: Optional[np.ndarray] = None,
         settings: Optional[ModularPreprocessingSettings] = None,
         intensity_properties_per_channel: Optional[dict] = None,
         target_is_segmentation: bool = True,
-        sampling_mask: np.ndarray | None = None,
+        sampling_mask: Optional[np.ndarray] = None,
         sampling_mask_properties: Optional[dict] = None,
     ) -> tuple[np.ndarray, Optional[np.ndarray], dict]:
         mode = PreprocessingMode.SEGMENTATION if target_is_segmentation else PreprocessingMode.GENERATIVE
@@ -414,13 +414,13 @@ class ModularPreprocessor:
 
 
 class SegmentationPreprocessor(ModularPreprocessor):
-    def run_case(self, image: np.ndarray, properties: dict, target: np.ndarray | None = None, **kwargs):
+    def run_case(self, image: np.ndarray, properties: dict, target: Optional[np.ndarray] = None, **kwargs):
         settings = kwargs.pop("settings", None) or ModularPreprocessingSettings.segmentation_defaults()
         return super().run_case(image, properties, target=target, settings=settings, target_is_segmentation=True, **kwargs)
 
 
 class GenerativePreprocessor(ModularPreprocessor):
-    def run_case(self, image: np.ndarray, properties: dict, target: np.ndarray | None = None, **kwargs):
+    def run_case(self, image: np.ndarray, properties: dict, target: Optional[np.ndarray] = None, **kwargs):
         settings = kwargs.pop("settings", None) or ModularPreprocessingSettings.generative_defaults()
         return super().run_case(image, properties, target=target, settings=settings, target_is_segmentation=False, **kwargs)
 
@@ -522,7 +522,7 @@ class TaskAwarePreprocessor:
         settings: Optional[ModularPreprocessingSettings],
         input_intensity_properties_per_channel: Optional[dict],
         reference_intensity_properties_per_channel: Optional[dict],
-        sampling_mask: np.ndarray | None = None,
+        sampling_mask: Optional[np.ndarray] = None,
         sampling_mask_properties: Optional[dict] = None,
     ) -> tuple[np.ndarray, np.ndarray, dict]:
         settings = _resolve_settings(settings, PreprocessingMode.GENERATIVE)
@@ -683,7 +683,7 @@ class TaskAwarePreprocessor:
         image_settings: Optional[ModularPreprocessingSettings] = None,
         input_intensity_properties_per_channel: Optional[dict] = None,
         reference_intensity_properties_per_channel: Optional[dict] = None,
-        sampling_mask: np.ndarray | None = None,
+        sampling_mask: Optional[np.ndarray] = None,
         sampling_mask_properties: Optional[dict] = None,
     ) -> TaskPreprocessedCase:
         self._validate_task_request(task_mode, run_stage, image, image_properties, reference, reference_properties)
@@ -811,13 +811,13 @@ class TaskAwarePreprocessor:
         image_reader,
         task_mode: str,
         run_stage: str,
-        reference_files: Optional[Sequence[str] | str] = None,
+        reference_files: Optional[Union[Sequence[str], str]] = None,
         reference_reader=None,
         image_settings: Optional[ModularPreprocessingSettings] = None,
         input_intensity_properties_per_channel: Optional[dict] = None,
         reference_intensity_properties_per_channel: Optional[dict] = None,
-        image_mask_files: Optional[Sequence[str] | str] = None,
-        target_mask_files: Optional[Sequence[str] | str] = None,
+        image_mask_files: Optional[Union[Sequence[str], str]] = None,
+        target_mask_files: Optional[Union[Sequence[str], str]] = None,
         mask_reader=None,
         mask_mode: Optional[str] = None,
         image_mask_threshold: Optional[float] = None,
