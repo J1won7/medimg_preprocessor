@@ -832,12 +832,10 @@ def _preprocess_segmentation_or_self_supervised(
             raise ValueError("segmentation train/predict_and_evaluate requires --target-dir")
     if args.run_stage == RunStage.PREDICT and args.target_dir is not None:
         raise ValueError("segmentation predict does not accept --target-dir")
-    if args.masking_mode is not None:
-        raise ValueError("segmentation uses the label-derived mask automatically and does not accept --masking-mode")
-    if image_mask_threshold is not None or target_mask_threshold is not None:
-        raise ValueError("segmentation does not accept mask threshold options")
 
     labels = _scan_single_image_dir(args.target_dir, "--target-dir") if args.target_dir is not None else None
+    if target_mask_threshold is not None and labels is None:
+        raise ValueError("segmentation --target-mask-threshold requires --target-dir")
     image_masks = _scan_optional_mask_dir(args.images_mask_dir, "--images-mask-dir")
     target_masks = _scan_optional_mask_dir(args.target_mask_dir, "--target-mask-dir")
     if image_masks is not None:
@@ -869,7 +867,12 @@ def _preprocess_segmentation_or_self_supervised(
             "image_mask_files": None if image_masks is None else image_masks[identifier][0],
             "target_mask_files": None if target_masks is None else target_masks[identifier][0],
             "mask_reader_name": args.mask_reader,
-            "mask_mode": None,
+            "mask_mode": args.masking_mode,
+            "image_mask_threshold": image_mask_threshold,
+            "target_mask_threshold": target_mask_threshold,
+            "mask_fill_holes": args.mask_fill_holes,
+            "mask_keep_largest_component": args.mask_keep_largest_component,
+            "mask_closing_iters": args.mask_closing_iters,
         }
         for identifier in identifiers
     ]
@@ -1533,8 +1536,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("threshold",),
         default=None,
         help=(
-            "Optional rule for generating a patch sampling mask when no external mask directory is provided. "
-            "Segmentation falls back to the label-derived mask when no external mask directory is provided. "
+            "Optional rule for generating a patch sampling mask. "
+            "Segmentation falls back to the label-derived mask when no mask source is provided. "
             "If omitted, non-segmentation modes sample from the full spatial extent."
         ),
     )

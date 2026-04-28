@@ -44,7 +44,8 @@ Add `--target-dir` when the selected mode needs a target.
 - `segmentation`
   - input: `--images-dir`
   - target: `--target-dir`
-  - uses label-derived mask automatically
+  - uses external or threshold sampling masks when provided
+  - falls back to label-derived sampling mask automatically
 
 - `paired_generative`
   - input: `--images-dir`
@@ -176,7 +177,9 @@ python -m medimg_preprocessor preprocess-dataset \
 
 #### Threshold-based masks
 
-Use threshold-based masks only when you do not have an external mask.
+Use threshold-based masks only when you do not have an external mask. In
+`segmentation`, these masks are sampling masks only; they do not rewrite the
+segmentation target labels.
 
 - `--masking-mode threshold`
   - enables threshold mask generation
@@ -217,6 +220,16 @@ python -m medimg_preprocessor preprocess-dataset \
   --images-mask-threshold -0.8 \
   --target-mask-threshold none \
   --output-folder preprocessed_paired
+```
+
+```bash
+python -m medimg_preprocessor preprocess-dataset \
+  --task-mode segmentation \
+  --images-dir raw/imagesTr \
+  --target-dir raw/labelsTr \
+  --masking-mode threshold \
+  --images-mask-threshold 0.0 \
+  --output-folder preprocessed_seg
 ```
 
 #### Mask post-processing
