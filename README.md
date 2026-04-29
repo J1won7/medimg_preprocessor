@@ -132,6 +132,11 @@ python -m medimg_preprocessor preprocess-dataset \
   - output array format
   - usually `blosc2` or `npz`
 
+- `--spacing`
+  - target voxel spacing used for resampling
+  - provide one value per spatial axis
+  - example: `--spacing 1.0 1.0 1.0`
+
 ### Cropping behavior
 
 The preprocessor no longer applies nnU-Net-style nonzero cropping during preprocessing.
@@ -281,6 +286,10 @@ You can let the tool plan preprocessing automatically, or provide a config/plans
 
 If you want to keep automatic planning or nnU-Net plans but force a safer label interpolation mode,
 you can override the segmentation label resampling order directly from the CLI.
+
+Automatic planning uses `image_order=3` and `label_order=1` by default. For
+instance segmentation, use `--label-order 0 --label-order-z 0` when label ID
+preservation is more important than smoother boundaries.
 
 - `--label-order 0`
   - nearest-neighbor style label resampling

@@ -497,21 +497,29 @@ def _override_normalization_config(
 def _override_resampling_config(
     config: Optional[PreprocessingConfig],
     *,
+    spacing: Optional[Sequence[float]],
     label_order: Optional[int],
     label_order_z: Optional[int],
 ) -> Optional[PreprocessingConfig]:
     if config is None:
         return None
-    if label_order is None and label_order_z is None:
+    if spacing is None and label_order is None and label_order_z is None:
         return config
 
+    next_spacing = config.spacing if spacing is None else tuple(float(i) for i in spacing)
+    if len(next_spacing) != len(config.spacing):
+        raise ValueError(
+            f"--spacing must have {len(config.spacing)} values for this dataset, got {len(next_spacing)}"
+        )
+    if any(i <= 0 for i in next_spacing):
+        raise ValueError(f"--spacing values must be positive, got {next_spacing}")
     next_label_order = config.resampling.label_order if label_order is None else int(label_order)
     next_label_order_z = config.resampling.label_order_z if label_order_z is None else int(label_order_z)
     if next_label_order < 0 or next_label_order_z < 0:
         raise ValueError("--label-order and --label-order-z must be non-negative")
 
     return PreprocessingConfig(
-        spacing=config.spacing,
+        spacing=next_spacing,
         transpose_forward=config.transpose_forward,
         normalization_schemes=config.normalization_schemes,
         use_mask_for_norm=config.use_mask_for_norm,
@@ -527,6 +535,28 @@ def _override_resampling_config(
             separate_z_anisotropy_threshold=config.resampling.separate_z_anisotropy_threshold,
         ),
     )
+
+
+def _override_configuration_spacings(
+    configurations: Optional[dict],
+    spacing: Optional[Sequence[float]],
+) -> Optional[dict]:
+    if configurations is None or spacing is None:
+        return configurations
+    next_spacing = [float(i) for i in spacing]
+    normalized = {}
+    for name, payload in configurations.items():
+        next_payload = dict(payload)
+        old_spacing = payload.get("spacing")
+        old_shape = payload.get("median_shape")
+        next_payload["spacing"] = list(next_spacing)
+        if old_spacing is not None and old_shape is not None and len(old_spacing) == len(next_spacing):
+            next_payload["median_shape"] = [
+                int(round(float(size) * float(old) / float(new)))
+                for size, old, new in zip(old_shape, old_spacing, next_spacing)
+            ]
+        normalized[name] = next_payload
+    return normalized
 
 
 def _resolve_default_configuration(configurations: Optional[dict]) -> Optional[str]:
@@ -1147,6 +1177,7 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
         )
         config_a = _override_resampling_config(
             config_a,
+            spacing=args.spacing,
             label_order=args.label_order,
             label_order_z=args.label_order_z,
         )
@@ -1158,6 +1189,7 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
         )
         config_b = _override_resampling_config(
             config_b,
+            spacing=args.spacing,
             label_order=args.label_order,
             label_order_z=args.label_order_z,
         )
@@ -1174,6 +1206,7 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
             normalization_method=args.normalization_method,
         )
         configurations = _merge_unpaired_configurations(configurations_a, configurations_b)
+        configurations = _override_configuration_spacings(configurations, args.spacing)
         default_configuration = _resolve_default_configuration(configurations)
         if default_patch_size is None and default_configuration is not None:
             default_patch_size = tuple(configurations[default_configuration]["patch_size"])
@@ -1231,9 +1264,11 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
             )
             base_config = _override_resampling_config(
                 base_config,
+                spacing=args.spacing,
                 label_order=args.label_order,
                 label_order_z=args.label_order_z,
             )
+            configurations = _override_configuration_spacings(configurations, args.spacing)
             _log_normalization_summary(
                 "image",
                 base_config,
@@ -1288,9 +1323,11 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
             )
             base_config = _override_resampling_config(
                 base_config,
+                spacing=args.spacing,
                 label_order=args.label_order,
                 label_order_z=args.label_order_z,
             )
+            configurations = _override_configuration_spacings(configurations, args.spacing)
             _log_normalization_summary(
                 "source",
                 base_config,
@@ -1422,6 +1459,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="DIM",
         help="manifest에 기록할 patch size override. 생략하면 planner가 자동 결정",
+    )
+    preprocess_parser.add_argument(
+        "--spacing",
+        type=float,
+        nargs="+",
+        default=None,
+        metavar="MM",
+        help=(
+            "Override target voxel spacing used for resampling. "
+            "Provide one value per spatial axis, for example --spacing 1.0 1.0 1.0."
+        ),
     )
     preprocess_parser.add_argument(
         "--storage-format",
