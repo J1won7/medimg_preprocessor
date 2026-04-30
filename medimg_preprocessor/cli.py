@@ -702,6 +702,38 @@ def _assert_matching_identifiers(
     return sorted(left_ids)
 
 
+def _filter_optional_matching_identifiers(
+    required: dict[str, list[str]],
+    optional: Optional[dict[str, list[str]]],
+    required_label: str,
+    optional_label: str,
+) -> Optional[dict[str, list[str]]]:
+    if optional is None:
+        return None
+    required_ids = set(required.keys())
+    optional_ids = set(optional.keys())
+    matched_ids = sorted(required_ids.intersection(optional_ids))
+    missing_required = sorted(optional_ids.difference(required_ids))
+    missing_optional = sorted(required_ids.difference(optional_ids))
+    if missing_required or missing_optional:
+        print(
+            f"  optional mask matching[{optional_label}]: using {len(matched_ids)} matched masks; "
+            f"ignored {len(missing_required)} masks without matching {required_label}; "
+            f"{len(missing_optional)} {required_label} cases have no optional mask",
+            flush=True,
+        )
+    return {identifier: optional[identifier] for identifier in matched_ids}
+
+
+def _optional_first_file(cases: Optional[dict[str, list[str]]], identifier: str) -> Optional[str]:
+    if cases is None:
+        return None
+    files = cases.get(identifier)
+    if not files:
+        return None
+    return files[0]
+
+
 def _preprocess_case(
     *,
     identifier: str,
@@ -812,8 +844,7 @@ def _preprocess_segmentation_or_self_supervised(
             raise ValueError("self_supervised does not accept --target-mask-dir")
         if target_mask_threshold is not None:
             raise ValueError("self_supervised does not accept --target-mask-threshold")
-        if image_masks is not None:
-            _assert_matching_identifiers(images, image_masks, "images", "images masks")
+        image_masks = _filter_optional_matching_identifiers(images, image_masks, "images", "images masks")
         identifiers = sorted(images.keys())
         work_items = [
             {
@@ -831,7 +862,7 @@ def _preprocess_segmentation_or_self_supervised(
                 "patch_sampling_min_fraction": args.patch_mask_min_fraction,
                 "patch_sampling_max_starts": args.patch_mask_max_starts,
                 "save_mask": args.save_mask,
-                "image_mask_files": None if image_masks is None else image_masks[identifier][0],
+                "image_mask_files": _optional_first_file(image_masks, identifier),
                 "mask_reader_name": args.mask_reader,
                 "mask_mode": args.masking_mode,
                 "image_mask_threshold": image_mask_threshold,
@@ -868,12 +899,11 @@ def _preprocess_segmentation_or_self_supervised(
         raise ValueError("segmentation --target-mask-threshold requires --target-dir")
     image_masks = _scan_optional_mask_dir(args.images_mask_dir, "--images-mask-dir")
     target_masks = _scan_optional_mask_dir(args.target_mask_dir, "--target-mask-dir")
-    if image_masks is not None:
-        _assert_matching_identifiers(images, image_masks, "images", "images masks")
+    image_masks = _filter_optional_matching_identifiers(images, image_masks, "images", "images masks")
     if target_masks is not None:
         if labels is None:
             raise ValueError("segmentation --target-mask-dir requires --target-dir")
-        _assert_matching_identifiers(labels, target_masks, "labels", "target masks")
+        target_masks = _filter_optional_matching_identifiers(labels, target_masks, "labels", "target masks")
     identifiers = sorted(images.keys()) if labels is None else _assert_matching_identifiers(images, labels, "images", "labels")
     work_items = [
         {
@@ -894,8 +924,8 @@ def _preprocess_segmentation_or_self_supervised(
             "patch_sampling_min_fraction": args.patch_mask_min_fraction,
             "patch_sampling_max_starts": args.patch_mask_max_starts,
             "save_mask": args.save_mask,
-            "image_mask_files": None if image_masks is None else image_masks[identifier][0],
-            "target_mask_files": None if target_masks is None else target_masks[identifier][0],
+            "image_mask_files": _optional_first_file(image_masks, identifier),
+            "target_mask_files": _optional_first_file(target_masks, identifier),
             "mask_reader_name": args.mask_reader,
             "mask_mode": args.masking_mode,
             "image_mask_threshold": image_mask_threshold,
@@ -952,12 +982,11 @@ def _preprocess_paired(
         if targets is None
         else _assert_matching_identifiers(sources, targets, "source", "target")
     )
-    if source_masks is not None:
-        _assert_matching_identifiers(sources, source_masks, "source", "source masks")
+    source_masks = _filter_optional_matching_identifiers(sources, source_masks, "source", "source masks")
     if target_masks is not None:
         if targets is None:
             raise ValueError("paired_generative --target-mask-dir requires --target-dir")
-        _assert_matching_identifiers(targets, target_masks, "target", "target masks")
+        target_masks = _filter_optional_matching_identifiers(targets, target_masks, "target", "target masks")
     work_items = [
         {
             "identifier": identifier,
@@ -977,8 +1006,8 @@ def _preprocess_paired(
             "patch_sampling_min_fraction": args.patch_mask_min_fraction,
             "patch_sampling_max_starts": args.patch_mask_max_starts,
             "save_mask": args.save_mask,
-            "image_mask_files": None if source_masks is None else source_masks[identifier][0],
-            "target_mask_files": None if target_masks is None else target_masks[identifier][0],
+            "image_mask_files": _optional_first_file(source_masks, identifier),
+            "target_mask_files": _optional_first_file(target_masks, identifier),
             "mask_reader_name": args.mask_reader,
             "mask_mode": args.masking_mode,
             "image_mask_threshold": image_mask_threshold,
@@ -1036,10 +1065,8 @@ def _preprocess_unpaired(
 
     identifiers_a = sorted(domain_a.keys())
     identifiers_b = sorted(domain_b.keys())
-    if masks_a is not None:
-        _assert_matching_identifiers(domain_a, masks_a, "domain A", "domain A masks")
-    if masks_b is not None:
-        _assert_matching_identifiers(domain_b, masks_b, "domain B", "domain B masks")
+    masks_a = _filter_optional_matching_identifiers(domain_a, masks_a, "domain A", "domain A masks")
+    masks_b = _filter_optional_matching_identifiers(domain_b, masks_b, "domain B", "domain B masks")
     work_items_a = [
         {
             "identifier": identifier,
@@ -1056,7 +1083,7 @@ def _preprocess_unpaired(
             "patch_sampling_min_fraction": args.patch_mask_min_fraction,
             "patch_sampling_max_starts": args.patch_mask_max_starts,
             "save_mask": args.save_mask,
-            "image_mask_files": None if masks_a is None else masks_a[identifier][0],
+            "image_mask_files": _optional_first_file(masks_a, identifier),
             "target_mask_files": None,
             "mask_reader_name": args.mask_reader,
             "mask_mode": args.masking_mode,
@@ -1084,7 +1111,7 @@ def _preprocess_unpaired(
             "patch_sampling_min_fraction": args.patch_mask_min_fraction,
             "patch_sampling_max_starts": args.patch_mask_max_starts,
             "save_mask": args.save_mask,
-            "image_mask_files": None if masks_b is None else masks_b[identifier][0],
+            "image_mask_files": _optional_first_file(masks_b, identifier),
             "target_mask_files": None,
             "mask_reader_name": args.mask_reader,
             "mask_mode": args.masking_mode,
