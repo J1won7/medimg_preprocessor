@@ -69,10 +69,10 @@ def postprocess_binary_mask(
     if closing_iters > 0:
         structure = generate_binary_structure(mask.ndim, 1)
         iterations = int(closing_iters)
-        # Treat the image boundary as foreground during closing. Otherwise the
-        # erosion step removes mask regions that legitimately touch an edge.
+        # Give dilation room to extend beyond the image boundary before the
+        # erosion step. Cropping restores the original field of view.
         padding = [(iterations, iterations)] * mask.ndim
-        padded_mask = np.pad(mask, padding, mode="constant", constant_values=True)
+        padded_mask = np.pad(mask, padding, mode="constant", constant_values=False)
         closed_mask = binary_closing(padded_mask, structure=structure, iterations=iterations)
         crop_slices = tuple(slice(iterations, -iterations) for _ in range(mask.ndim))
         mask = closed_mask[crop_slices]
