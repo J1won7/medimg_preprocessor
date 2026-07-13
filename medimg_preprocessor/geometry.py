@@ -68,7 +68,14 @@ def postprocess_binary_mask(
         mask = binary_fill_holes(mask)
     if closing_iters > 0:
         structure = generate_binary_structure(mask.ndim, 1)
-        mask = binary_closing(mask, structure=structure, iterations=int(closing_iters))
+        iterations = int(closing_iters)
+        # Treat the image boundary as foreground during closing. Otherwise the
+        # erosion step removes mask regions that legitimately touch an edge.
+        padding = [(iterations, iterations)] * mask.ndim
+        padded_mask = np.pad(mask, padding, mode="constant", constant_values=True)
+        closed_mask = binary_closing(padded_mask, structure=structure, iterations=iterations)
+        crop_slices = tuple(slice(iterations, -iterations) for _ in range(mask.ndim))
+        mask = closed_mask[crop_slices]
     if keep_largest_component and np.any(mask):
         structure = generate_binary_structure(mask.ndim, 1)
         labeled, num = label(mask, structure=structure)
