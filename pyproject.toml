@@ -30,6 +30,13 @@ dependencies = [
   "tifffile; python_version >= '3.8'",
   "scikit-image>=0.19,<0.20; python_version < '3.8'",
   "scikit-image; python_version >= '3.8'",
+  # Pin scikit-image's transitive dependencies because current releases no
+  # longer support Python 3.7 and older pip resolvers may select them first.
+  "imageio>=2.4.1,<2.29; python_version < '3.8'",
+  "PyWavelets>=1.1.1,<1.4; python_version < '3.8'",
+  "networkx>=2.2,<2.7; python_version < '3.8'",
+  "Pillow>=6.1,<9.6; python_version < '3.8'",
+  "packaging>=20,<24; python_version < '3.8'",
 ]
 
 [project.optional-dependencies]
