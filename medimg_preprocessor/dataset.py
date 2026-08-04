@@ -6,6 +6,7 @@ import json
 import os
 import pickle
 import math
+import sys
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 import warnings
 
@@ -31,7 +32,9 @@ from .preprocessing import RunStage, TaskMode, TaskPreprocessedCase
 
 
 MANIFEST_FILENAME = "preprocessing_manifest.json"
-DEFAULT_STORAGE_FORMAT = "blosc2"
+# Python-Blosc2 does not provide Python 3.7 builds. Keep the established
+# compressed default on newer interpreters and use the built-in NPZ format on 3.7.
+DEFAULT_STORAGE_FORMAT = "blosc2" if sys.version_info >= (3, 8) else "npz"
 DEFAULT_MASK_LOCATION_SAMPLES = 10000
 
 

@@ -26,6 +26,9 @@ Or install from Git:
 pip install git+https://github.com/J1won7/medimg_preprocessor.git
 ```
 
+Python 3.7 이상을 지원합니다. Python 3.7에서는 `blosc2`가 제공되지 않아
+기본 저장 포맷이 `npz`이며, Python 3.8 이상에서는 기존처럼 `blosc2`가 기본입니다.
+
 ## Preprocessing
 
 ### Basic command

@@ -12,6 +12,7 @@ from typing import Optional, Sequence, Union
 
 from .config import PreprocessingConfig, ResamplingConfig
 from .dataset import (
+    DEFAULT_STORAGE_FORMAT,
     load_preprocessed_dataset_manifest,
     save_preprocessed_case,
     save_preprocessed_dataset,
@@ -161,6 +162,11 @@ def _run_case_progress(
 
 def _ensure_storage_runtime(storage_format: str) -> None:
     if storage_format == "blosc2":
+        if sys.version_info < (3, 8):
+            raise ValueError(
+                "storage_format='blosc2' is not available on Python 3.7 because Python-Blosc2 "
+                "does not provide compatible builds; use storage_format='npz' instead."
+            )
         try:
             import blosc2  # noqa: F401
         except ModuleNotFoundError as e:
@@ -747,7 +753,7 @@ def _preprocess_case(
     reference_files: Optional[Union[list[str], str]] = None,
     reference_reader_name: Optional[str] = None,
     reference_dataset_json: Optional[dict] = None,
-    storage_format: str = "blosc2",
+    storage_format: str = DEFAULT_STORAGE_FORMAT,
     patch_size_hint: Optional[Sequence[int]] = None,
     patch_sampling_patch_sizes: Optional[dict[str, tuple[int, ...]]] = None,
     patch_sampling_min_fraction: float = 0.0,
@@ -1501,8 +1507,8 @@ def build_parser() -> argparse.ArgumentParser:
     preprocess_parser.add_argument(
         "--storage-format",
         choices=("blosc2", "npz"),
-        default="blosc2",
-        help="저장 포맷. 기본값: blosc2",
+        default=DEFAULT_STORAGE_FORMAT,
+        help=f"저장 포맷. 기본값: {DEFAULT_STORAGE_FORMAT}",
     )
     preprocess_parser.add_argument(
         "--num-processes",
@@ -1800,8 +1806,8 @@ def build_parser() -> argparse.ArgumentParser:
     save_parser.add_argument(
         "--storage-format",
         choices=("blosc2", "npz"),
-        default="blosc2",
-        help="manifest에 기록할 저장 포맷. 기본값: blosc2",
+        default=DEFAULT_STORAGE_FORMAT,
+        help=f"manifest에 기록할 저장 포맷. 기본값: {DEFAULT_STORAGE_FORMAT}",
     )
     save_parser.add_argument(
         "--val-ratio",

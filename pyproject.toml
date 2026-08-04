@@ -1,5 +1,10 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = [
+  "setuptools>=61,<68; python_version < '3.8'",
+  "setuptools>=68; python_version >= '3.8'",
+  "wheel>=0.37,<0.42; python_version < '3.8'",
+  "wheel; python_version >= '3.8'",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,26 +12,34 @@ name = "medimg-preprocessor"
 version = "0.1.0"
 description = "Standalone nnU-Net-style medical image preprocessing for segmentation and generative workflows."
 readme = { file = "medimg_preprocessor/README.md", content-type = "text/markdown" }
-requires-python = ">=3.8"
+requires-python = ">=3.7"
 authors = [
   { name = "J1won7" }
 ]
 dependencies = [
-  "numpy>=1.23",
-  "scipy>=1.10",
-  "blosc2",
-  "nibabel",
-  "SimpleITK",
-  "tifffile",
-  "scikit-image"
+  "numpy>=1.21,<1.22; python_version < '3.8'",
+  "numpy>=1.23; python_version >= '3.8'",
+  "scipy>=1.7,<1.8; python_version < '3.8'",
+  "scipy>=1.10; python_version >= '3.8'",
+  "blosc2; python_version >= '3.8'",
+  "nibabel>=4.0.2,<4.1; python_version < '3.8'",
+  "nibabel; python_version >= '3.8'",
+  "SimpleITK==2.1.1; python_version < '3.8'",
+  "SimpleITK; python_version >= '3.8'",
+  "tifffile==2021.11.2; python_version < '3.8'",
+  "tifffile; python_version >= '3.8'",
+  "scikit-image>=0.19,<0.20; python_version < '3.8'",
+  "scikit-image; python_version >= '3.8'",
 ]
 
 [project.optional-dependencies]
 dataset = [
-  "torch>=1.13"
+  "torch>=1.13,<2.0; python_version < '3.8'",
+  "torch>=1.13; python_version >= '3.8'",
 ]
 dev = [
-  "pytest"
+  "pytest<7.5; python_version < '3.8'",
+  "pytest; python_version >= '3.8'",
 ]
 
 [project.scripts]
