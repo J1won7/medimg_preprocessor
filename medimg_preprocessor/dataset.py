@@ -1018,11 +1018,13 @@ def _crop_with_starts_padded(
             missing = int(wanted) - int(current)
             before = missing // 2
             after = missing - before
+            shifted_start = 0
         else:
             before = max(-start, 0)
             after = max(start + int(wanted) - int(current), 0)
+            shifted_start = start + before
         pad_width.append((before, after))
-        shifted_starts.append(start + before)
+        shifted_starts.append(shifted_start)
     if any(before or after for before, after in pad_width):
         array = np.pad(array, pad_width, mode="constant", constant_values=0)
     cropped = _crop_spatial(array, target, shifted_starts)
