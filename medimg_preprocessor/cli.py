@@ -101,6 +101,17 @@ NORMALIZATION_METHOD_CHOICES = (
     "ZScoreNormalization",
     "MinMaxClipNormalization",
 )
+INTERPOLATION_METHOD_CHOICES = (
+    "nearest",
+    "linear",
+    "quadratic",
+    "cubic",
+    "quartic",
+    "quintic",
+)
+INTERPOLATION_METHOD_ORDERS = {
+    name: order for order, name in enumerate(INTERPOLATION_METHOD_CHOICES)
+}
 MASK_THRESHOLD_UNSET = object()
 
 
@@ -196,12 +207,22 @@ def _load_config_from_json(path: Optional[str]) -> Optional[PreprocessingConfig]
         ),
         resampling=ResamplingConfig(
             image_order=int(resampling_payload.get("image_order", 3)),
-            image_order_z=int(resampling_payload.get("image_order_z", 1)),
+            image_orders=(
+                tuple(int(i) for i in resampling_payload["image_orders"])
+                if resampling_payload.get("image_orders") is not None
+                else None
+            ),
             label_order=int(resampling_payload.get("label_order", 0)),
-            label_order_z=int(resampling_payload.get("label_order_z", 0)),
-            force_separate_z=resampling_payload.get("force_separate_z", None),
-            separate_z_anisotropy_threshold=float(
-                resampling_payload.get("separate_z_anisotropy_threshold", 3.0)
+            label_orders=(
+                tuple(int(i) for i in resampling_payload["label_orders"])
+                if resampling_payload.get("label_orders") is not None
+                else None
+            ),
+            mask_order=int(resampling_payload.get("mask_order", 0)),
+            mask_orders=(
+                tuple(int(i) for i in resampling_payload["mask_orders"])
+                if resampling_payload.get("mask_orders") is not None
+                else None
             ),
         ),
     )
@@ -505,18 +526,26 @@ def _override_resampling_config(
     *,
     spacing: Optional[Sequence[float]],
     image_order: Optional[int],
-    image_order_z: Optional[int],
     label_order: Optional[int],
-    label_order_z: Optional[int],
+    image_interpolation: Optional[str],
+    image_interpolation_axes: Optional[Sequence[str]],
+    label_interpolation: Optional[str],
+    label_interpolation_axes: Optional[Sequence[str]],
+    mask_interpolation: Optional[str],
+    mask_interpolation_axes: Optional[Sequence[str]],
 ) -> Optional[PreprocessingConfig]:
     if config is None:
         return None
     if (
         spacing is None
         and image_order is None
-        and image_order_z is None
         and label_order is None
-        and label_order_z is None
+        and image_interpolation is None
+        and image_interpolation_axes is None
+        and label_interpolation is None
+        and label_interpolation_axes is None
+        and mask_interpolation is None
+        and mask_interpolation_axes is None
     ):
         return config
 
@@ -527,13 +556,52 @@ def _override_resampling_config(
         )
     if any(i <= 0 for i in next_spacing):
         raise ValueError(f"--spacing values must be positive, got {next_spacing}")
-    next_image_order = config.resampling.image_order if image_order is None else int(image_order)
-    next_image_order_z = config.resampling.image_order_z if image_order_z is None else int(image_order_z)
-    next_label_order = config.resampling.label_order if label_order is None else int(label_order)
-    next_label_order_z = config.resampling.label_order_z if label_order_z is None else int(label_order_z)
-    if min(next_image_order, next_image_order_z, next_label_order, next_label_order_z) < 0:
-        raise ValueError(
-            "--image-order, --image-order-z, --label-order, and --label-order-z must be non-negative"
+
+    if image_order is not None and image_interpolation is not None:
+        raise ValueError("Use either --image-order or --image-interpolation, not both")
+    if label_order is not None and label_interpolation is not None:
+        raise ValueError("Use either --label-order or --label-interpolation, not both")
+
+    next_image_order = config.resampling.image_order
+    next_image_orders = config.resampling.image_orders
+    if image_order is not None:
+        next_image_order = int(image_order)
+        next_image_orders = None
+    elif image_interpolation is not None:
+        next_image_order = _interpolation_order(image_interpolation, "--image-interpolation")
+        next_image_orders = None
+    if image_interpolation_axes is not None:
+        next_image_orders = _interpolation_orders_from_cli(
+            image_interpolation_axes,
+            len(next_spacing),
+            "--image-interpolation-axes",
+        )
+
+    next_label_order = config.resampling.label_order
+    next_label_orders = config.resampling.label_orders
+    if label_order is not None:
+        next_label_order = int(label_order)
+        next_label_orders = None
+    elif label_interpolation is not None:
+        next_label_order = _interpolation_order(label_interpolation, "--label-interpolation")
+        next_label_orders = None
+    if label_interpolation_axes is not None:
+        next_label_orders = _interpolation_orders_from_cli(
+            label_interpolation_axes,
+            len(next_spacing),
+            "--label-interpolation-axes",
+        )
+
+    next_mask_order = config.resampling.mask_order
+    next_mask_orders = config.resampling.mask_orders
+    if mask_interpolation is not None:
+        next_mask_order = _interpolation_order(mask_interpolation, "--mask-interpolation")
+        next_mask_orders = None
+    if mask_interpolation_axes is not None:
+        next_mask_orders = _interpolation_orders_from_cli(
+            mask_interpolation_axes,
+            len(next_spacing),
+            "--mask-interpolation-axes",
         )
 
     return PreprocessingConfig(
@@ -546,13 +614,33 @@ def _override_resampling_config(
         },
         resampling=ResamplingConfig(
             image_order=next_image_order,
-            image_order_z=next_image_order_z,
+            image_orders=next_image_orders,
             label_order=next_label_order,
-            label_order_z=next_label_order_z,
-            force_separate_z=config.resampling.force_separate_z,
-            separate_z_anisotropy_threshold=config.resampling.separate_z_anisotropy_threshold,
+            label_orders=next_label_orders,
+            mask_order=next_mask_order,
+            mask_orders=next_mask_orders,
         ),
     )
+
+
+def _interpolation_order(method: str, option_name: str) -> int:
+    try:
+        return INTERPOLATION_METHOD_ORDERS[method]
+    except KeyError:
+        choices = ", ".join(INTERPOLATION_METHOD_CHOICES)
+        raise ValueError(f"{option_name} must be one of {choices}, got {method!r}")
+
+
+def _interpolation_orders_from_cli(
+    methods: Sequence[str],
+    expected_dims: int,
+    option_name: str,
+) -> tuple:
+    if len(methods) != expected_dims:
+        raise ValueError(
+            f"{option_name} must contain {expected_dims} values for this dataset, got {len(methods)}"
+        )
+    return tuple(_interpolation_order(method, option_name) for method in methods)
 
 
 def _override_configuration_spacings(
@@ -1224,9 +1312,13 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
             config_a,
             spacing=args.spacing,
             image_order=args.image_order,
-            image_order_z=args.image_order_z,
             label_order=args.label_order,
-            label_order_z=args.label_order_z,
+            image_interpolation=args.image_interpolation,
+            image_interpolation_axes=args.image_interpolation_axes,
+            label_interpolation=args.label_interpolation,
+            label_interpolation_axes=args.label_interpolation_axes,
+            mask_interpolation=args.mask_interpolation,
+            mask_interpolation_axes=args.mask_interpolation_axes,
         )
         config_b = _override_normalization_config(
             config_b,
@@ -1238,9 +1330,13 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
             config_b,
             spacing=args.spacing,
             image_order=args.image_order,
-            image_order_z=args.image_order_z,
             label_order=args.label_order,
-            label_order_z=args.label_order_z,
+            image_interpolation=args.image_interpolation,
+            image_interpolation_axes=args.image_interpolation_axes,
+            label_interpolation=args.label_interpolation,
+            label_interpolation_axes=args.label_interpolation_axes,
+            mask_interpolation=args.mask_interpolation,
+            mask_interpolation_axes=args.mask_interpolation_axes,
         )
         _log_normalization_summary(
             "domain_a",
@@ -1315,9 +1411,13 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                 base_config,
                 spacing=args.spacing,
                 image_order=args.image_order,
-                image_order_z=args.image_order_z,
                 label_order=args.label_order,
-                label_order_z=args.label_order_z,
+                image_interpolation=args.image_interpolation,
+                image_interpolation_axes=args.image_interpolation_axes,
+                label_interpolation=args.label_interpolation,
+                label_interpolation_axes=args.label_interpolation_axes,
+                mask_interpolation=args.mask_interpolation,
+                mask_interpolation_axes=args.mask_interpolation_axes,
             )
             configurations = _override_configuration_spacings(configurations, args.spacing)
             _log_normalization_summary(
@@ -1376,9 +1476,13 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                 base_config,
                 spacing=args.spacing,
                 image_order=args.image_order,
-                image_order_z=args.image_order_z,
                 label_order=args.label_order,
-                label_order_z=args.label_order_z,
+                image_interpolation=args.image_interpolation,
+                image_interpolation_axes=args.image_interpolation_axes,
+                label_interpolation=args.label_interpolation,
+                label_interpolation_axes=args.label_interpolation_axes,
+                mask_interpolation=args.mask_interpolation,
+                mask_interpolation_axes=args.mask_interpolation_axes,
             )
             configurations = _override_configuration_spacings(configurations, args.spacing)
             _log_normalization_summary(
@@ -1748,18 +1852,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Upper bound used by MinMaxClipNormalization. Requires --normalization-method MinMaxClipNormalization.",
     )
     preprocess_parser.add_argument(
-        "--image-order",
-        type=int,
+        "--image-interpolation",
+        choices=INTERPOLATION_METHOD_CHOICES,
         default=None,
-        help="Override the in-plane image resampling order. The default is 3 (cubic).",
+        help="Image interpolation method for all spatial axes. Default: cubic.",
     )
     preprocess_parser.add_argument(
-        "--image-order-z",
-        type=int,
+        "--image-interpolation-axes",
+        nargs="+",
+        choices=INTERPOLATION_METHOD_CHOICES,
         default=None,
         help=(
-            "Override the image resampling order along the low-resolution axis when separate-z resampling is used. "
-            "The default is 1 (linear interpolation)."
+            "Image interpolation methods for each spatial axis in post-transpose order. "
+            "The number of values must match the dimensionality."
         ),
     )
     preprocess_parser.add_argument(
@@ -1767,19 +1872,47 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Override the segmentation-label resampling order. "
-            "0 keeps nearest-neighbor style label preservation. "
-            "1 resizes each label mask separately and can smooth boundaries."
+            "Legacy numeric alias for --label-interpolation. "
+            "0 is nearest-neighbor style; 1 is linear per-label interpolation."
         ),
     )
     preprocess_parser.add_argument(
-        "--label-order-z",
-        type=int,
+        "--label-interpolation",
+        choices=INTERPOLATION_METHOD_CHOICES,
+        default=None,
+        help="Label interpolation method for all spatial axes. Default: planned label method.",
+    )
+    preprocess_parser.add_argument(
+        "--label-interpolation-axes",
+        nargs="+",
+        choices=INTERPOLATION_METHOD_CHOICES,
         default=None,
         help=(
-            "Override the z-axis segmentation-label resampling order when separate-z resampling is used. "
-            "0 is the safest choice for label-id preservation."
+            "Label interpolation methods for each spatial axis in post-transpose order. "
+            "The number of values must match the dimensionality."
         ),
+    )
+    preprocess_parser.add_argument(
+        "--mask-interpolation",
+        choices=INTERPOLATION_METHOD_CHOICES,
+        default=None,
+        help="Sampling-mask interpolation method for all spatial axes. Default: nearest.",
+    )
+    preprocess_parser.add_argument(
+        "--mask-interpolation-axes",
+        nargs="+",
+        choices=INTERPOLATION_METHOD_CHOICES,
+        default=None,
+        help=(
+            "Sampling-mask interpolation methods for each spatial axis in post-transpose order. "
+            "The number of values must match the dimensionality."
+        ),
+    )
+    preprocess_parser.add_argument(
+        "--image-order",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     _add_bool_flag(
         preprocess_parser,

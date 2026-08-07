@@ -5,17 +5,43 @@ from dataclasses import dataclass, field
 import math
 from statistics import median
 import warnings
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, Optional, Sequence, Tuple, Union
+
+
+MAX_INTERPOLATION_ORDER = 5
 
 
 @dataclass
 class ResamplingConfig:
     image_order: int = 3
-    image_order_z: int = 1
+    image_orders: Optional[Tuple[int, ...]] = None
     label_order: int = 0
-    label_order_z: int = 0
-    force_separate_z: Optional[bool] = None
-    separate_z_anisotropy_threshold: float = 3.0
+    label_orders: Optional[Tuple[int, ...]] = None
+    mask_order: int = 0
+    mask_orders: Optional[Tuple[int, ...]] = None
+
+    def __post_init__(self) -> None:
+        self.image_order = _validate_interpolation_order("image_order", self.image_order)
+        self.label_order = _validate_interpolation_order("label_order", self.label_order)
+        self.mask_order = _validate_interpolation_order("mask_order", self.mask_order)
+        self.image_orders = _normalize_interpolation_orders("image_orders", self.image_orders)
+        self.label_orders = _normalize_interpolation_orders("label_orders", self.label_orders)
+        self.mask_orders = _normalize_interpolation_orders("mask_orders", self.mask_orders)
+
+    def orders_for(self, role: str, spatial_dims: int) -> Tuple[int, ...]:
+        if spatial_dims <= 0:
+            _fail_validation(f"spatial_dims must be positive, got {spatial_dims}")
+        if role not in {"image", "label", "mask"}:
+            _fail_validation(f"Unknown resampling role '{role}'")
+        default_order = int(getattr(self, f"{role}_order"))
+        axis_orders = getattr(self, f"{role}_orders")
+        if axis_orders is None:
+            return tuple(default_order for _ in range(spatial_dims))
+        if len(axis_orders) != spatial_dims:
+            _fail_validation(
+                f"{role}_orders must contain {spatial_dims} values for this data, got {len(axis_orders)}"
+            )
+        return tuple(axis_orders)
 
 
 @dataclass
@@ -60,21 +86,13 @@ class PreprocessingConfig:
             )
         for scheme in normalization_schemes:
             get_normalizer(scheme)
-        if self.resampling.image_order < 0 or self.resampling.label_order < 0:
-            _fail_validation(
-                f"Resampling orders must be non-negative, got image={self.resampling.image_order}, "
-                f"label={self.resampling.label_order}"
-            )
-        if self.resampling.image_order_z < 0 or self.resampling.label_order_z < 0:
-            _fail_validation(
-                f"Z resampling orders must be non-negative, got image_z={self.resampling.image_order_z}, "
-                f"label_z={self.resampling.label_order_z}"
-            )
-        if self.resampling.separate_z_anisotropy_threshold <= 0:
-            _fail_validation(
-                "ResamplingConfig.separate_z_anisotropy_threshold must be positive, "
-                f"got {self.resampling.separate_z_anisotropy_threshold}"
-            )
+        for role in ("image", "label", "mask"):
+            axis_orders = getattr(self.resampling, f"{role}_orders")
+            if axis_orders is not None and len(axis_orders) != len(spacing):
+                _fail_validation(
+                    f"{role}_orders must have {len(spacing)} values for this configuration, "
+                    f"got {len(axis_orders)}"
+                )
 
         self.spacing = spacing
         self.transpose_forward = transpose_forward
@@ -115,10 +133,8 @@ class PreprocessingConfig:
             ),
             resampling=ResamplingConfig(
                 image_order=int(data_kwargs.get("order", 3)),
-                image_order_z=int(data_kwargs.get("order_z", 1)),
                 label_order=int(seg_kwargs.get("order", 0)),
-                label_order_z=int(seg_kwargs.get("order_z", 0)),
-                force_separate_z=data_kwargs.get("force_separate_z", None),
+                mask_order=0,
             ),
         )
 
@@ -186,3 +202,27 @@ def _resolve_configuration_inheritance(plans: dict, configuration_name: str) -> 
 def _fail_validation(message: str) -> None:
     warnings.warn(message, stacklevel=2)
     raise ValueError(message)
+
+
+def _validate_interpolation_order(name: str, value: int) -> int:
+    try:
+        order = int(value)
+    except (TypeError, ValueError):
+        _fail_validation(f"{name} must be an integer, got {value!r}")
+    if order < 0 or order > MAX_INTERPOLATION_ORDER:
+        _fail_validation(
+            f"{name} must be between 0 and {MAX_INTERPOLATION_ORDER}, got {order}"
+        )
+    return order
+
+
+def _normalize_interpolation_orders(
+    name: str,
+    values: Optional[Sequence[int]],
+) -> Optional[Tuple[int, ...]]:
+    if values is None:
+        return None
+    normalized = tuple(_validate_interpolation_order(name, value) for value in values)
+    if len(normalized) == 0:
+        _fail_validation(f"{name} must contain at least one value when provided")
+    return normalized

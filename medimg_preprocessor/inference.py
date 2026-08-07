@@ -202,16 +202,12 @@ def _undo_preprocessing(pred: np.ndarray, properties: Dict[str, Any], config: Pr
 
     if settings.get("resample", True):
         shape_before_resampling = tuple(int(i) for i in properties["shape_before_resampling"])
+        image_orders = config.resampling.orders_for("image", restored.ndim - 1)
         restored = resample_array(
             restored,
             shape_before_resampling,
-            properties["spacing_after_resampling"],
-            properties["spacing_after_transpose"],
             is_seg=False,
-            order=config.resampling.image_order,
-            order_z=config.resampling.image_order_z,
-            force_separate_z=config.resampling.force_separate_z,
-            separate_z_anisotropy_threshold=config.resampling.separate_z_anisotropy_threshold,
+            orders=image_orders,
         )
 
     if settings.get("transpose", True):

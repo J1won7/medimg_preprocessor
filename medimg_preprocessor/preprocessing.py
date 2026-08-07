@@ -311,87 +311,55 @@ class ModularPreprocessor:
             if len(target_spacing) < len(image.shape[1:]):
                 target_spacing = [spacing[0]] + target_spacing
             new_shape = compute_new_shape(image.shape[1:], spacing, target_spacing)
+            image_orders = self.config.resampling.orders_for("image", image.ndim - 1)
+            label_orders = self.config.resampling.orders_for("label", image.ndim - 1)
+            mask_orders = self.config.resampling.orders_for("mask", image.ndim - 1)
             image = resample_array(
                 image,
                 new_shape,
-                spacing,
-                target_spacing,
                 is_seg=False,
-                order=self.config.resampling.image_order,
-                order_z=self.config.resampling.image_order_z,
-                force_separate_z=self.config.resampling.force_separate_z,
-                separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+                orders=image_orders,
             )
             patch_sampling_image = resample_array(
                 patch_sampling_image,
                 new_shape,
-                spacing,
-                target_spacing,
                 is_seg=False,
-                order=self.config.resampling.image_order,
-                order_z=self.config.resampling.image_order_z,
-                force_separate_z=self.config.resampling.force_separate_z,
-                separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+                orders=image_orders,
             )
             patch_sampling_mask = resample_array(
                 patch_sampling_mask[None].astype(np.float32),
                 new_shape,
-                spacing,
-                target_spacing,
                 is_seg=True,
-                order=self.config.resampling.label_order,
-                order_z=self.config.resampling.label_order_z,
-                force_separate_z=self.config.resampling.force_separate_z,
-                separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+                orders=mask_orders,
             )[0] > 0
             if target is not None:
                 if target_is_segmentation:
                     target = resample_array(
                         target,
                         new_shape,
-                        spacing,
-                        target_spacing,
                         is_seg=True,
-                        order=self.config.resampling.label_order,
-                        order_z=self.config.resampling.label_order_z,
-                        force_separate_z=self.config.resampling.force_separate_z,
-                        separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+                        orders=label_orders,
                     )
                     if patch_sampling_target is not None:
                         patch_sampling_target = resample_array(
                             patch_sampling_target,
                             new_shape,
-                            spacing,
-                            target_spacing,
                             is_seg=True,
-                            order=self.config.resampling.label_order,
-                            order_z=self.config.resampling.label_order_z,
-                            force_separate_z=self.config.resampling.force_separate_z,
-                            separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+                            orders=label_orders,
                         )
                 else:
                     target = resample_array(
                         target,
                         new_shape,
-                        spacing,
-                        target_spacing,
                         is_seg=False,
-                        order=self.config.resampling.image_order,
-                        order_z=self.config.resampling.image_order_z,
-                        force_separate_z=self.config.resampling.force_separate_z,
-                        separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+                        orders=image_orders,
                     )
                     if patch_sampling_target is not None:
                         patch_sampling_target = resample_array(
                             patch_sampling_target,
                             new_shape,
-                            spacing,
-                            target_spacing,
                             is_seg=False,
-                            order=self.config.resampling.image_order,
-                            order_z=self.config.resampling.image_order_z,
-                            force_separate_z=self.config.resampling.force_separate_z,
-                            separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+                            orders=image_orders,
                         )
             properties["spacing_after_resampling"] = target_spacing
             properties["shape_after_resampling"] = tuple(int(i) for i in new_shape)
@@ -606,60 +574,37 @@ class TaskAwarePreprocessor:
             if len(target_spacing) < len(image.shape[1:]):
                 target_spacing = [spacing[0]] + target_spacing
             new_shape = compute_new_shape(image.shape[1:], spacing, target_spacing)
+            image_orders = self.config.resampling.orders_for("image", image.ndim - 1)
+            mask_orders = self.config.resampling.orders_for("mask", image.ndim - 1)
             image = resample_array(
                 image,
                 new_shape,
-                spacing,
-                target_spacing,
                 is_seg=False,
-                order=self.config.resampling.image_order,
-                order_z=self.config.resampling.image_order_z,
-                force_separate_z=self.config.resampling.force_separate_z,
-                separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+                orders=image_orders,
             )
             patch_sampling_image = resample_array(
                 patch_sampling_image,
                 new_shape,
-                spacing,
-                target_spacing,
                 is_seg=False,
-                order=self.config.resampling.image_order,
-                order_z=self.config.resampling.image_order_z,
-                force_separate_z=self.config.resampling.force_separate_z,
-                separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+                orders=image_orders,
             )
             reference = resample_array(
                 reference,
                 new_shape,
-                spacing,
-                target_spacing,
                 is_seg=False,
-                order=self.config.resampling.image_order,
-                order_z=self.config.resampling.image_order_z,
-                force_separate_z=self.config.resampling.force_separate_z,
-                separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+                orders=image_orders,
             )
             patch_sampling_reference = resample_array(
                 patch_sampling_reference,
                 new_shape,
-                spacing,
-                target_spacing,
                 is_seg=False,
-                order=self.config.resampling.image_order,
-                order_z=self.config.resampling.image_order_z,
-                force_separate_z=self.config.resampling.force_separate_z,
-                separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+                orders=image_orders,
             )
             patch_sampling_mask = resample_array(
                 patch_sampling_mask[None].astype(np.float32),
                 new_shape,
-                spacing,
-                target_spacing,
                 is_seg=True,
-                order=self.config.resampling.label_order,
-                order_z=self.config.resampling.label_order_z,
-                force_separate_z=self.config.resampling.force_separate_z,
-                separate_z_anisotropy_threshold=self.config.resampling.separate_z_anisotropy_threshold,
+                orders=mask_orders,
             )[0] > 0
             properties["spacing_after_resampling"] = target_spacing
             properties["shape_after_resampling"] = tuple(int(i) for i in new_shape)

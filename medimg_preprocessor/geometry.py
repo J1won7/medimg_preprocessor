@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-from collections import OrderedDict
-from copy import deepcopy
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence
 import warnings
 
 import numpy as np
-from scipy.ndimage import binary_closing, binary_fill_holes, generate_binary_structure, label, map_coordinates
+from scipy.ndimage import binary_closing, binary_fill_holes, generate_binary_structure, label
 from skimage.transform import resize
 
 
-ANISO_THRESHOLD = 3.0
+MAX_INTERPOLATION_ORDER = 5
 
 
 def _fail_validation(message: str) -> None:
@@ -107,48 +105,6 @@ def compute_new_shape(
     return np.array([int(round(i / j * k)) for i, j, k in zip(old_spacing, new_spacing, old_shape)])
 
 
-def get_do_separate_z(spacing: Sequence[float], anisotropy_threshold: float = ANISO_THRESHOLD) -> bool:
-    spacing = np.asarray(spacing, dtype=np.float64)
-    return bool((np.max(spacing) / np.min(spacing)) > anisotropy_threshold)
-
-
-def get_lowres_axis(new_spacing: Sequence[float]) -> np.ndarray:
-    new_spacing = np.asarray(new_spacing, dtype=np.float64)
-    return np.where(max(new_spacing) / new_spacing == 1)[0]
-
-
-def determine_do_sep_z_and_axis(
-    force_separate_z: Optional[bool],
-    current_spacing: Sequence[float],
-    new_spacing: Sequence[float],
-    separate_z_anisotropy_threshold: float = ANISO_THRESHOLD,
-) -> Tuple[bool, Optional[int]]:
-    if force_separate_z is not None:
-        do_separate_z = bool(force_separate_z)
-        axis = get_lowres_axis(current_spacing) if do_separate_z else None
-    else:
-        if get_do_separate_z(current_spacing, separate_z_anisotropy_threshold):
-            do_separate_z = True
-            axis = get_lowres_axis(current_spacing)
-        elif get_do_separate_z(new_spacing, separate_z_anisotropy_threshold):
-            do_separate_z = True
-            axis = get_lowres_axis(new_spacing)
-        else:
-            do_separate_z = False
-            axis = None
-
-    if axis is not None:
-        if len(axis) == 3:
-            do_separate_z = False
-            axis = None
-        elif len(axis) == 2:
-            do_separate_z = False
-            axis = None
-        else:
-            axis = int(axis[0])
-    return do_separate_z, axis
-
-
 def _resize_segmentation(segmentation: np.ndarray, new_shape: Sequence[int], order: int = 1) -> np.ndarray:
     if order == 0:
         return resize(
@@ -174,15 +130,31 @@ def _resize_segmentation(segmentation: np.ndarray, new_shape: Sequence[int], ord
     return result
 
 
+def _resize_data_or_seg(
+    data: np.ndarray,
+    new_shape: Sequence[int],
+    *,
+    is_seg: bool,
+    order: int,
+) -> np.ndarray:
+    if is_seg:
+        return _resize_segmentation(data, new_shape, order=order)
+    return resize(
+        data,
+        new_shape,
+        order=order,
+        mode="edge",
+        anti_aliasing=False,
+        preserve_range=True,
+    )
+
+
 def _resample_data_or_seg(
     data: np.ndarray,
     new_shape: Sequence[int],
     *,
-    is_seg: bool = False,
-    axis: Optional[int] = None,
-    order: int = 3,
-    do_separate_z: bool = False,
-    order_z: int = 0,
+    is_seg: bool,
+    orders: Sequence[int],
     dtype_out=None,
 ) -> np.ndarray:
     if data.ndim not in (3, 4):
@@ -190,113 +162,78 @@ def _resample_data_or_seg(
     if len(new_shape) != data.ndim - 1:
         _fail_validation(f"new_shape must match spatial dims, got {new_shape} for data shape {data.shape}")
 
-    resize_fn = _resize_segmentation if is_seg else resize
-    kwargs = OrderedDict() if is_seg else {"mode": "edge", "anti_aliasing": False, "preserve_range": True}
+    new_shape = tuple(int(i) for i in new_shape)
+    orders = tuple(int(i) for i in orders)
+    if len(orders) != len(new_shape):
+        _fail_validation(
+            f"orders must contain {len(new_shape)} values for the spatial dimensions, got {len(orders)}"
+        )
+    if any(order < 0 or order > MAX_INTERPOLATION_ORDER for order in orders):
+        _fail_validation(
+            f"orders must be between 0 and {MAX_INTERPOLATION_ORDER}, got {orders}"
+        )
 
-    shape = np.array(data[0].shape)
-    new_shape = np.array(new_shape)
+    shape = tuple(int(i) for i in data.shape[1:])
     if dtype_out is None:
         dtype_out = data.dtype
     reshaped_final = np.zeros((data.shape[0], *new_shape), dtype=dtype_out)
-    if np.any(shape != new_shape):
-        data = data.astype(float, copy=False)
-        if data.ndim == 3:
-            for c in range(data.shape[0]):
-                reshaped_final[c] = resize_fn(data[c], new_shape, order, **kwargs)
-            return reshaped_final
-        if do_separate_z:
-            if axis is None:
-                _fail_validation("axis is required when do_separate_z is True")
-            if axis == 0:
-                new_shape_2d = new_shape[1:]
-            elif axis == 1:
-                new_shape_2d = new_shape[[0, 2]]
-            else:
-                new_shape_2d = new_shape[:-1]
+    if shape == new_shape:
+        return data
 
-            for c in range(data.shape[0]):
-                tmp = deepcopy(new_shape)
-                tmp[axis] = shape[axis]
-                reshaped_here = np.zeros(tmp)
-                for slice_id in range(shape[axis]):
-                    if axis == 0:
-                        reshaped_here[slice_id] = resize_fn(data[c, slice_id], new_shape_2d, order, **kwargs)
-                    elif axis == 1:
-                        reshaped_here[:, slice_id] = resize_fn(data[c, :, slice_id], new_shape_2d, order, **kwargs)
-                    else:
-                        reshaped_here[:, :, slice_id] = resize_fn(data[c, :, :, slice_id], new_shape_2d, order, **kwargs)
-                if shape[axis] != new_shape[axis]:
-                    rows, cols, dim = new_shape[0], new_shape[1], new_shape[2]
-                    orig_rows, orig_cols, orig_dim = reshaped_here.shape
-                    row_scale = float(orig_rows) / rows
-                    col_scale = float(orig_cols) / cols
-                    dim_scale = float(orig_dim) / dim
-
-                    map_rows, map_cols, map_dims = np.mgrid[:rows, :cols, :dim]
-                    map_rows = row_scale * (map_rows + 0.5) - 0.5
-                    map_cols = col_scale * (map_cols + 0.5) - 0.5
-                    map_dims = dim_scale * (map_dims + 0.5) - 0.5
-
-                    coord_map = np.array([map_rows, map_cols, map_dims])
-                    if not is_seg or order_z == 0:
-                        reshaped_final[c] = map_coordinates(
-                            reshaped_here,
-                            coord_map,
-                            order=order_z,
-                            mode="nearest",
-                        )[None]
-                    else:
-                        for label in np.unique(reshaped_here):
-                            mask = map_coordinates(
-                                (reshaped_here == label).astype(float),
-                                coord_map,
-                                order=order_z,
-                                mode="nearest",
-                            )
-                            reshaped_final[c][np.round(mask) > 0.5] = label
-                else:
-                    reshaped_final[c] = reshaped_here
-        else:
-            for c in range(data.shape[0]):
-                reshaped_final[c] = resize_fn(data[c], new_shape, order, **kwargs)
+    data = data.astype(float, copy=False)
+    if len(set(orders)) == 1:
+        for c in range(data.shape[0]):
+            reshaped_final[c] = _resize_data_or_seg(
+                data[c],
+                new_shape,
+                is_seg=is_seg,
+                order=orders[0],
+            )
         return reshaped_final
-    return data
+
+    # Different orders are applied one spatial axis at a time. This keeps the
+    # interpolation policy explicit for every axis instead of treating one
+    # axis as a special "z" dimension.
+    for c in range(data.shape[0]):
+        resampled = data[c]
+        for axis, order in enumerate(orders):
+            if resampled.shape[axis] == new_shape[axis]:
+                continue
+            axis_shape = list(resampled.shape)
+            axis_shape[axis] = new_shape[axis]
+            resampled = _resize_data_or_seg(
+                resampled,
+                tuple(axis_shape),
+                is_seg=is_seg,
+                order=order,
+            )
+        reshaped_final[c] = resampled
+    return reshaped_final
 
 
 def resample_array(
     data: np.ndarray,
     new_shape: Sequence[int],
-    current_spacing: Sequence[float],
-    new_spacing: Sequence[float],
     *,
     is_seg: bool,
-    order: int,
-    order_z: int = 0,
-    force_separate_z: Optional[bool] = None,
-    separate_z_anisotropy_threshold: float = ANISO_THRESHOLD,
+    orders: Optional[Sequence[int]] = None,
+    order: Optional[int] = None,
 ) -> np.ndarray:
-    if order < 0:
-        _fail_validation(f"Interpolation order must be non-negative, got {order}")
     if len(new_shape) != data.ndim - 1:
         _fail_validation(
             f"new_shape must match data spatial dims, got {len(new_shape)} and data shape {data.shape}"
         )
     if any(i <= 0 for i in new_shape):
         _fail_validation(f"new_shape must contain only positive values, got {tuple(new_shape)}")
-    if tuple(data.shape[1:]) == tuple(new_shape):
-        return data
-    do_separate_z, axis = determine_do_sep_z_and_axis(
-        force_separate_z,
-        current_spacing,
-        new_spacing,
-        separate_z_anisotropy_threshold,
-    )
+    if orders is not None and order is not None:
+        _fail_validation("Provide either orders or order, not both")
+    if orders is None:
+        if order is None:
+            _fail_validation("orders must be provided")
+        orders = tuple(int(order) for _ in range(len(new_shape)))
     return _resample_data_or_seg(
         data,
         new_shape,
         is_seg=is_seg,
-        axis=axis,
-        order=order,
-        do_separate_z=do_separate_z,
-        order_z=order_z,
+        orders=orders,
     )

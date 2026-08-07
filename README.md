@@ -1,72 +1,41 @@
 # medimg_preprocessor
 
-Medical image preprocessing utility for:
+CT, MRI, CBCT와 같은 의료 영상을 위한 범용 전처리 도구입니다. nnU-Net의
+planning 아이디어를 참고하지만, 특정 학습 프레임워크에 종속되지 않도록
+segmentation과 생성 모델 전처리를 함께 지원합니다.
 
-- `segmentation`
-- `paired_generative`
-- `unpaired_generative`
-- `self_supervised`
+주요 기능:
 
-It provides:
+- 데이터셋 자동 스캔과 전처리 설정 계획
+- segmentation, instance segmentation, paired/unpaired generative 전처리
+- 외부 mask 또는 threshold 기반 patch sampling mask 생성
+- 원하는 voxel spacing으로 영상과 label/mask resampling
+- 전처리 결과 manifest 생성
+- PyTorch Dataset 및 sliding-window inference 지원
 
-- dataset planning
-- preprocessing
-- saved preprocessed datasets
-- PyTorch dataset loading
-
-## Installation
-
-```bash
-pip install -e .
-```
-
-Or install from Git:
+## 설치
 
 ```bash
-pip install git+https://github.com/J1won7/medimg_preprocessor.git
+python -m pip install git+https://github.com/J1won7/medimg_preprocessor.git
 ```
 
-Python 3.7 이상을 지원합니다. Python 3.7에서는 `blosc2`가 제공되지 않아
-기본 저장 포맷이 `npz`이며, Python 3.8 이상에서는 기존처럼 `blosc2`가 기본입니다.
-
-## Preprocessing
-
-### Basic command
+로컬 소스에서 개발하려면:
 
 ```bash
-python -m medimg_preprocessor preprocess-dataset \
-  --task-mode <mode> \
-  --images-dir <images_dir> \
-  --output-folder <output_folder>
+python -m pip install -e .
 ```
 
-Add `--target-dir` when the selected mode needs a target.
+### Python 버전
 
-### Task modes
+- Python 3.8 이상을 권장합니다.
+- Python 3.7도 사용할 수 있지만 `blosc2` 저장 형식은 사용할 수 없습니다. 이 경우 `npz`를 사용해야 합니다.
+- Python 3.7에서 전처리할 때는 `--storage-format npz`를 명시하는 것이 안전합니다.
+- Python 3.6 이하는 지원하지 않습니다.
 
-- `segmentation`
-  - input: `--images-dir`
-  - target: `--target-dir`
-  - uses external or threshold sampling masks when provided
-  - falls back to label-derived sampling mask automatically
+Python 3.7에서 생성된 `npz` 결과는 Python 3.8 이상에서도 읽을 수 있습니다. 반대로
+Python 3.7 환경에서는 Python 3.8 이상에서 생성한 `blosc2`/`.b2nd` 결과를 읽을 수 없습니다.
 
-- `paired_generative`
-  - input: `--images-dir`
-  - target: `--target-dir`
-  - supports image-side and target-side masks
-
-- `unpaired_generative`
-  - input: `--images-dir`
-  - target: `--target-dir`
-  - domain A and domain B are preprocessed separately
-
-- `self_supervised`
-  - input: `--images-dir`
-  - no target directory
-
-### Quick examples
-
-#### 1. Segmentation
+## 가장 간단한 사용법
 
 ```bash
 python -m medimg_preprocessor preprocess-dataset \
@@ -76,102 +45,88 @@ python -m medimg_preprocessor preprocess-dataset \
   --output-folder preprocessed_seg
 ```
 
-#### 2. Paired Generative
+실행이 끝나면 `preprocessing_manifest.json`과 전처리된 case 파일이
+`--output-folder` 아래에 저장됩니다.
+
+## Task 모드
+
+| 모드 | `--images-dir` | `--target-dir` | 용도 |
+| --- | --- | --- | --- |
+| `segmentation` | 입력 영상 | segmentation label | semantic 또는 instance segmentation |
+| `paired_generative` | source 영상 | paired target 영상 | source와 target이 일대일 대응하는 생성 모델 |
+| `unpaired_generative` | domain A | domain B | 서로 대응하지 않는 두 도메인 |
+| `self_supervised` | 입력 영상 | 사용하지 않음 | self-supervised 학습 |
+
+`--task-mode`에 따라 필요한 디렉토리만 지정하면 됩니다.
+
+## 입력 파일 규칙
+
+기본적으로 이미지와 target/mask는 파일명에서 확장자를 제거한 case identifier가
+같아야 합니다. 예를 들어 다음 두 파일은 같은 case로 인식됩니다.
+
+```text
+imagesTr/case_0001.nii.gz
+labelsTr/case_0001.nii.gz
+```
+
+여러 채널을 파일로 나누어 저장한 경우에는 `--multi-image`를 사용합니다.
+
+```text
+case_0001_0000.nii.gz
+case_0001_0001.nii.gz
+```
+
+## Segmentation과 Instance Segmentation
+
+`segmentation` 모드는 semantic segmentation뿐 아니라 각 객체에 서로 다른 label
+번호가 들어 있는 instance label도 처리할 수 있습니다. target 파일의 각 voxel 값은
+그대로 label map으로 취급됩니다.
+
+### Semantic segmentation
 
 ```bash
 python -m medimg_preprocessor preprocess-dataset \
-  --task-mode paired_generative \
-  --images-dir raw/source \
-  --target-dir raw/target \
-  --output-folder preprocessed_paired
+  --task-mode segmentation \
+  --images-dir data/imagesTr \
+  --target-dir data/labelsTr \
+  --output-folder data/preprocessed_seg \
+  --spacing 1.0 1.0 1.0 \
+  --label-interpolation nearest
 ```
 
-#### 3. Unpaired Generative
+### Instance segmentation
+
+instance ID를 보존해야 한다면 label은 nearest-neighbor를 권장합니다.
 
 ```bash
 python -m medimg_preprocessor preprocess-dataset \
-  --task-mode unpaired_generative \
-  --images-dir raw/domain_a \
-  --target-dir raw/domain_b \
-  --output-folder preprocessed_unpaired
+  --task-mode segmentation \
+  --images-dir data/imagesTr \
+  --images-mask-dir data/kidney_maskTr \
+  --target-dir data/instance_labelsTr \
+  --output-folder data/preprocessed_instance \
+  --spacing 1.0 1.0 1.0 \
+  --label-interpolation nearest \
+  --mask-interpolation nearest \
+  --save-mask
 ```
 
-#### 4. Self-Supervised
+`--label-interpolation linear`을 사용하면 각 label ID를 binary mask로 분리한 뒤
+각각 보간하고 다시 label map으로 합칩니다. 경계가 부드러워질 수 있지만 얇은 구조나
+서로 가까운 instance가 변할 수 있으므로, 객체 ID 보존이 중요하면 `nearest`가 더 안전합니다.
 
-```bash
-python -m medimg_preprocessor preprocess-dataset \
-  --task-mode self_supervised \
-  --images-dir raw/images \
-  --output-folder preprocessed_ssl
-```
+## Mask와 Patch Sampling
 
-### Common parameters
+mask는 target label을 바꾸기 위한 mask가 아니라, patch를 어디에서 추출할지 결정하는
+sampling mask입니다. mask가 있으면 patch 중심 voxel을 mask 내부에서 선택합니다.
 
-- `--task-mode`
-  - preprocessing mode
-  - one of `segmentation`, `paired_generative`, `unpaired_generative`, `self_supervised`
+mask 생성 규칙:
 
-- `--images-dir`
-  - main input directory
+- 외부 mask와 threshold mask가 함께 있으면 두 mask를 합쳐서 사용합니다.
+- 외부/threshold mask가 하나도 없고 segmentation target이 있으면 target label에서 mask를 만듭니다.
+- 그 외 모드에서 mask가 없으면 전체 영상 범위에서 patch를 sampling합니다.
 
-- `--target-dir`
-  - target directory
-  - required for `segmentation`, `paired_generative`, `unpaired_generative`
-
-- `--output-folder`
-  - folder where preprocessed files and manifest are saved
-
-- `--num-processes`
-  - number of worker processes used during preprocessing
-
-- `--run-stage`
-  - usually `train`
-  - controls whether train/val splits and training metadata are created
-
-- `--multi-image`
-  - enables multi-channel file grouping such as `case_0001_0000.nii.gz`, `case_0001_0001.nii.gz`
-
-- `--storage-format`
-  - output array format
-  - usually `blosc2` or `npz`
-
-- `--spacing`
-  - target voxel spacing used for resampling
-  - provide one value per spatial axis
-  - example: `--spacing 1.0 1.0 1.0`
-
-### Cropping behavior
-
-The preprocessor no longer applies nnU-Net-style nonzero cropping during preprocessing.
-
-- image and target arrays keep their original spatial extent until resampling
-- segmentation labels are not rewritten to `-1` outside an image-derived crop box
-- saved label semantics stay closer to the original dataset
-
-### Masking
-
-Patch sampling is based on the saved mask when a mask is available.
-
-Default behavior:
-
-- `segmentation`
-  - uses an external mask first when provided
-  - otherwise falls back to the label as the sampling mask automatically
-
-- other modes
-  - if no mask is given, patches are sampled from the full spatial range
-
-#### External mask directories
-
-- `--images-mask-dir`
-  - mask directory aligned with `--images-dir`
-
-- `--target-mask-dir`
-  - mask directory aligned with `--target-dir`
-
-If mask directories are given, they are used first.
-
-Example:
+### 외부 mask
 
 ```bash
 python -m medimg_preprocessor preprocess-dataset \
@@ -183,436 +138,267 @@ python -m medimg_preprocessor preprocess-dataset \
   --output-folder preprocessed_paired
 ```
 
-#### Threshold-based masks
+- `--images-mask-dir`: `--images-dir`와 대응하는 mask 디렉토리
+- `--target-mask-dir`: `--target-dir`와 대응하는 mask 디렉토리
 
-Use threshold-based masks only when you do not have an external mask. In
-`segmentation`, these masks are sampling masks only; they do not rewrite the
-segmentation target labels.
+### Threshold mask
 
-- `--masking-mode threshold`
-  - enables threshold mask generation
-
-- `--mask-threshold`
-  - shorthand threshold applied to both image and target sides
-
-- `--images-mask-threshold`
-  - threshold only for image-side mask generation
-
-- `--target-mask-threshold`
-  - threshold only for target-side mask generation
-
-Rules:
-
-- if only `--mask-threshold` is given, both sides use that threshold
-- if `--images-mask-threshold` or `--target-mask-threshold` is also given, that side overrides the common threshold
-- use `none` to disable one side explicitly
-
-Examples:
+외부 mask가 없을 때 threshold 기반 mask를 만들 수 있습니다.
 
 ```bash
 python -m medimg_preprocessor preprocess-dataset \
-  --task-mode paired_generative \
-  --images-dir raw/source \
-  --target-dir raw/target \
-  --masking-mode threshold \
-  --mask-threshold -0.8 \
-  --output-folder preprocessed_paired
-```
-
-```bash
-python -m medimg_preprocessor preprocess-dataset \
-  --task-mode paired_generative \
-  --images-dir raw/source \
-  --target-dir raw/target \
-  --masking-mode threshold \
-  --images-mask-threshold -0.8 \
-  --target-mask-threshold none \
-  --output-folder preprocessed_paired
-```
-
-```bash
-python -m medimg_preprocessor preprocess-dataset \
-  --task-mode segmentation \
-  --images-dir raw/imagesTr \
-  --target-dir raw/labelsTr \
+  --task-mode unpaired_generative \
+  --images-dir raw/CBCT \
+  --target-dir raw/dCT \
+  --output-folder preprocessed \
   --masking-mode threshold \
   --images-mask-threshold 0.0 \
-  --output-folder preprocessed_seg
+  --target-mask-threshold 0.0
 ```
 
-#### Mask post-processing
+관련 옵션:
 
-- `--mask-fill-holes`
-  - fill holes in the generated mask
-  - default: enabled
+- `--mask-threshold`: image와 target 양쪽에 공통 적용
+- `--images-mask-threshold`: image 쪽에만 적용
+- `--target-mask-threshold`: target 쪽에만 적용
+- `none`: 해당 쪽 threshold mask를 명시적으로 끔
 
-- `--mask-keep-largest-component`
-  - keep only the largest connected component
-  - default: enabled
+생성된 mask에는 기본적으로 hole filling, largest component 유지, binary closing이
+적용됩니다. 옵션은 다음과 같습니다.
 
-- `--mask-closing-iters`
-  - binary closing iterations
-  - default: `1`
+- `--mask-fill-holes` / `--no-mask-fill-holes`
+- `--mask-keep-largest-component` / `--no-mask-keep-largest-component`
+- `--mask-closing-iters N`
 
-### Patch sampling
+경계에 붙은 mask가 closing 과정에서 깎이지 않도록 closing 시 임시 zero padding을
+적용한 뒤 원래 영상 크기로 되돌립니다.
 
-The loader now uses nnUNet-style dynamic patch sampling:
+### 저장되는 `_mask` 파일
 
-- preprocessing saves mask voxel locations
-- dataset loading samples a valid voxel from the saved locations
-- a patch bbox is created dynamically at runtime
+`_mask`는 patch sampling용 mask입니다. normalization에서 사용하는
+`use_mask_for_norm`과는 다른 기능입니다.
 
-Related options:
+- `--save-mask`: mask를 결과에 저장. blosc2에서는 `_mask.b2nd`, npz에서는 `.npz` 내부 배열로 저장
+- `--no-save-mask`: mask 파일을 저장하지 않음
 
-- `--patch-mask-max-starts`
-  - maximum number of saved foreground/mask voxel locations
-  - default: `8192`
+파일을 저장하지 않아도 patch sampling 자체는 mask를 사용합니다. segmentation 학습
+단계에서는 기본적으로 `_mask` 파일을 저장하지 않지만, 필요하면 `--save-mask`를 사용하십시오.
 
-- `--patch-mask-min-fraction`
-  - legacy fallback option for older precomputed-start workflows
-  - usually can be left as default
+## Cropping 동작
 
-### Planning and configuration
+이 도구는 더 이상 nnU-Net식 `crop_to_nonzero`를 적용하지 않습니다.
 
-You can let the tool plan preprocessing automatically, or provide a config/plans file.
+- 원래 image/target의 spatial extent를 유지합니다.
+- image-derived crop 바깥 label을 `-1`로 바꾸지 않습니다.
+- 전처리 후 label 의미가 원본 데이터와 동일하게 유지됩니다.
 
-- `--config-json`
-  - use an explicit preprocessing config
+따라서 patch를 mask 내부에서 sampling할 수는 있지만, 전처리 단계에서 영상 자체를
+자동으로 잘라내지는 않습니다.
 
-- `--plans-file`
-  - load preprocessing settings from nnUNet-style plans
+## Voxel Spacing과 보간
 
-- `--configuration-name`
-  - select a configuration inside the plans file
-
-### Label resampling override
-
-If you want to keep automatic planning or nnU-Net plans but force a safer label interpolation mode,
-you can override the segmentation label resampling order directly from the CLI.
-
-Automatic planning uses `image_order=3` and `label_order=1` by default. For
-instance segmentation, use `--label-order 0 --label-order-z 0` when label ID
-preservation is more important than smoother boundaries.
-
-- `--label-order 0`
-  - nearest-neighbor style label resampling
-  - safest option when label IDs must be preserved exactly
-  - usually preferred for instance IDs or very small structures
-
-- `--label-order 1`
-  - resizes each label mask separately and then reconstructs the label map
-  - can make boundaries a bit smoother
-  - may alter thin structures or tightly packed instances
-
-- `--label-order-z 0`
-  - same idea, but only for the separate-z pass used on anisotropic volumes
-
-### Stored mask files
-
-The saved `_mask` file is a stored sampling mask. It is not the same thing as
-`use_mask_for_norm` in the normalization config.
-
-- `--save-mask`
-  - force writing the derived sampling mask to disk
-
-- `--no-save-mask`
-  - skip writing the `_mask` file
-
-Default behavior:
-
-- `segmentation` with `train`
-  - `_mask` file is not written by default
-  - patch sampling still uses label-derived foreground locations
-
-- other modes or stages
-  - `_mask` file is written by default, as before
-
-Example:
+`--spacing`에는 원하는 target voxel spacing을 공간축 순서대로 입력합니다.
 
 ```bash
-python -m medimg_preprocessor preprocess-dataset \
-  --task-mode segmentation \
-  --images-dir raw/imagesTr \
-  --target-dir raw/labelsTr \
-  --output-folder preprocessed_seg \
-  --label-order 0 \
-  --no-save-mask
+--spacing 1.0 1.0 1.0
 ```
 
-### Normalization
+예를 들어 원본 spacing이 `1.5 x 3.0 x 1.5`이고 target이 `1.0 x 1.0 x 1.0`이면,
+각 축의 voxel 수가 각각 약 1.5배, 3배, 1.5배로 변경됩니다. 영상, label, mask 모두
+동일한 shape 변환을 거치며 특정 축만 자동으로 복사하는 separate-z 경로는 사용하지 않습니다.
 
-Useful normalization options:
+### 보간 방식 지정
 
-- `--normalization-method auto`
-- `--normalization-method CTNormalization`
-- `--normalization-method ZScoreNormalization`
-- `--normalization-method MinMaxClipNormalization`
+지원 방식은 `nearest`, `linear`, `quadratic`, `cubic`, `quartic`, `quintic`입니다.
 
-Examples:
+기본값:
+
+- image: cubic
+- 자동 planning된 segmentation label: linear
+- sampling mask: nearest
+
+전체 공간축에 같은 방식을 적용하려면:
+
+```bash
+--image-interpolation cubic
+--label-interpolation nearest
+--mask-interpolation nearest
+```
+
+축별로 다르게 지정하려면 spatial axis 개수만큼 입력합니다. 입력 순서는 transpose
+이후의 spatial axis 순서입니다.
+
+```bash
+--image-interpolation-axes cubic linear cubic
+--label-interpolation-axes nearest nearest nearest
+--mask-interpolation-axes nearest linear nearest
+```
+
+기존 숫자 옵션인 `--label-order 0`, `--label-order 1`도 호환성을 위해 지원하지만,
+새 명령에서는 의미가 분명한 `--label-interpolation` 사용을 권장합니다.
+
+## Normalization
+
+자동 planning을 그대로 사용하거나 normalization을 직접 지정할 수 있습니다.
+
+```bash
+--normalization-method auto
+--normalization-method CTNormalization
+--normalization-method ZScoreNormalization
+--normalization-method MinMaxClipNormalization
+```
+
+CT에서 고정 범위로 clip하려면:
 
 ```bash
 python -m medimg_preprocessor preprocess-dataset \
   --task-mode paired_generative \
-  --images-dir raw/source \
-  --target-dir raw/target \
-  --output-folder preprocessed_paired \
-  --normalization-method ZScoreNormalization
-```
-
-```bash
-python -m medimg_preprocessor preprocess-dataset \
-  --task-mode paired_generative \
-  --images-dir raw/source \
-  --target-dir raw/target \
-  --output-folder preprocessed_paired \
+  --images-dir raw/CBCT \
+  --target-dir raw/dCT \
+  --output-folder preprocessed \
   --normalization-method MinMaxClipNormalization \
   --normalization-min -1000 \
-  --normalization-max 2000
+  --normalization-max 1000
 ```
 
-## Dataset Usage
+## 자주 사용하는 옵션
 
-### Basic loading
+- `--num-processes N`: planning과 전처리에 사용할 worker 수
+- `--run-stage train|predict|predict_and_evaluate`: 실행 단계
+- `--default-patch-size 96 96 96`: planner가 정한 patch size 대신 사용할 크기
+- `--multi-image`: 한 case가 여러 파일로 구성된 multi-channel 입력일 때 사용
+- `--storage-format blosc2|npz`: 결과 저장 형식
+- `--config-json PATH`: 직접 작성한 preprocessing config 사용
+- `--plans-file PATH --configuration-name NAME`: nnU-Net 스타일 plans 사용
+
+## 출력 구조와 Manifest
+
+blosc2 저장 형식:
+
+```text
+preprocessed/
+├── preprocessing_manifest.json
+├── case_0001.b2nd
+├── case_0001_target.b2nd
+├── case_0001_mask.b2nd     # --save-mask를 사용한 경우
+└── case_0001.pkl
+```
+
+`npz` 저장 형식:
+
+```text
+preprocessed/
+├── preprocessing_manifest.json
+├── case_0001.npz           # image, target, mask 배열을 포함할 수 있음
+└── case_0001.pkl
+```
+
+`preprocessing_manifest.json`에는 task mode, case 목록, spacing, normalization,
+resampling, split, 저장 형식이 기록됩니다.
+
+resampling 설정은 다음처럼 저장됩니다.
+
+- `image_order`: 모든 축에 적용할 image 보간 order
+- `image_orders`: 축별 image 보간 order
+- `label_order`: 모든 축에 적용할 label 보간 order
+- `label_orders`: 축별 label 보간 order
+- `mask_order`: 모든 축에 적용할 sampling mask 보간 order
+- `mask_orders`: 축별 sampling mask 보간 order
+
+보간 order는 `0=nearest`, `1=linear`, `2=quadratic`, `3=cubic`의 의미입니다.
+현재는 특정 축을 z로 간주하는 `image_order_z`, `label_order_z` 설정을 사용하지 않습니다.
+
+manifest만 다시 생성해야 하는 경우:
+
+```bash
+python -m medimg_preprocessor save-dataset \
+  --folder preprocessed_seg \
+  --task-mode segmentation
+```
+
+manifest 내용을 확인하려면:
+
+```bash
+python -m medimg_preprocessor show-manifest \
+  --folder preprocessed_seg
+```
+
+## PyTorch Dataset 사용
+
+```bash
+python -m pip install "medimg-preprocessor[dataset]"
+```
 
 ```python
 from torch.utils.data import DataLoader
 from medimg_preprocessor import load_preprocessed_dataset
 
-dataset = load_preprocessed_dataset("preprocessed_paired")
+dataset = load_preprocessed_dataset("preprocessed_seg", split="train")
 loader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=4)
 
-batch = next(iter(loader))
-print(batch["image"].shape)
-```
-
-### Load a specific configuration
-
-```python
-from medimg_preprocessor import load_preprocessed_dataset
-
-dataset_2d = load_preprocessed_dataset("preprocessed_seg", configuration="2d")
-dataset_3d = load_preprocessed_dataset("preprocessed_seg", configuration="3d")
-```
-
-### Load train/val split
-
-```python
-from medimg_preprocessor import load_preprocessed_dataset
-
-train_ds = load_preprocessed_dataset("preprocessed_seg", split="train")
-val_ds = load_preprocessed_dataset("preprocessed_seg", split="val")
-```
-
-### Self-supervised usage
-
-```python
-from medimg_preprocessor import load_preprocessed_dataset
-
-dataset = load_preprocessed_dataset("preprocessed_ssl")
-sample = dataset[0]
-
+sample = next(iter(loader))
 print(sample["image"].shape)
-print(sample["view1"].shape)
-print(sample["view2"].shape)
+print(sample["target"].shape)
 ```
 
-### Unpaired usage
+다음 dataset class도 직접 사용할 수 있습니다.
 
-```python
-from medimg_preprocessor import load_preprocessed_dataset
+- `SegmentationDataset`
+- `PairedGenerativeDataset`
+- `UnpairedGenerativeDataset`
+- `SelfSupervisedDataset`
 
-dataset = load_preprocessed_dataset("preprocessed_unpaired")
-sample = dataset[0]
+## Inference
 
-print(sample["image_a"].shape)
-print(sample["image_b"].shape)
-```
-
-## Inference Usage
-
-### Raw-image inference
-
-Use `RawInferencePatchDataset` when you want to:
-
-- read raw NIfTI or similar image files directly
-- preprocess them at runtime
-- split large volumes into overlapping patches
-- merge patch predictions back into a full volume
-- restore the output to the original image space
-- save the result with the original NIfTI affine and header
-
-### Important behavior
-
-- `patch_size` is required
-- large volumes are processed with sliding-window overlap
-- overlapping patch predictions are averaged
-- final output is restored to the original spatial shape
-- `save_prediction_nifti(...)` keeps the original NIfTI affine/header
-
-### Basic inference example
+원본 영상에서 runtime preprocessing과 sliding-window inference를 수행하려면
+`RawInferencePatchDataset`를 사용합니다.
 
 ```python
 from torch.utils.data import DataLoader
 from medimg_preprocessor import PreprocessingConfig, RawInferencePatchDataset
 
-config = PreprocessingConfig()
-
-dataset = RawInferencePatchDataset(
-    images_dir="raw_cbct",
-    config=config,
-    patch_size=(32, 192, 192),
-    overlap=0.5,
-    image_reader="auto",
-    multi_image=False,
+config = PreprocessingConfig(
+    spacing=(1.0, 1.0, 1.0),
+    transpose_forward=(0, 1, 2),
+    normalization_schemes=("ZScoreNormalization",),
+    use_mask_for_norm=(False,),
 )
 
-loader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=0)
-```
-
-### Patch prediction and reconstruction
-
-```python
-acc = dataset.build_accumulator(case_index=0, channels=1)
-
-for batch in loader:
-    pred = model(batch["image"])  # [B, C, D, H, W]
-    pred = pred.detach().cpu().numpy()
-    starts = batch["starts"].cpu().numpy()
-
-    for i in range(pred.shape[0]):
-        acc.add_patch(pred[i], starts[i])
-
-full_pred = acc.finalize()
-dataset.save_prediction_nifti(full_pred, case_index=0, output_path="pred_case001.nii.gz")
-```
-
-### Returned fields
-
-Each sample from `RawInferencePatchDataset` contains:
-
-- `image`
-- `identifier`
-- `case_index`
-- `patch_index`
-- `starts`
-- `patch_size`
-
-### Main parameters
-
-- `images_dir`
-  - raw image directory
-
-- `config`
-  - preprocessing config used at runtime
-
-- `patch_size`
-  - required patch size for inference
-
-- `overlap`
-  - sliding-window overlap ratio
-
-- `image_reader`
-  - image IO backend
-
-- `multi_image`
-  - enable grouped multi-channel inputs
-
-## Dataset Classes
-
-### `SegmentationDataset`
-
-- mode: `segmentation`
-- target required: yes
-- typical use:
-
-```python
-from medimg_preprocessor.dataset import SegmentationDataset
-
-dataset = SegmentationDataset("preprocessed_seg", patch_size=(64, 128, 128))
-```
-
-### `PairedGenerativeDataset`
-
-- mode: `paired_generative`
-- target required: yes
-- typical use:
-
-```python
-from medimg_preprocessor.dataset import PairedGenerativeDataset
-
-dataset = PairedGenerativeDataset("preprocessed_paired", patch_size=(32, 192, 192))
-```
-
-### `SelfSupervisedDataset`
-
-- mode: `self_supervised`
-- target required: no
-- returns `image`, `view1`, `view2`
-- typical use:
-
-```python
-from medimg_preprocessor.dataset import SelfSupervisedDataset
-
-dataset = SelfSupervisedDataset("preprocessed_ssl", patch_size=(32, 192, 192))
-```
-
-### `UnpairedGenerativeDataset`
-
-- mode: `unpaired_generative`
-- target required: no paired target
-- returns `image_a`, `image_b`
-- typical use:
-
-```python
-from medimg_preprocessor.dataset import UnpairedGenerativeDataset
-
-dataset = UnpairedGenerativeDataset(
-    folder_a="preprocessed_unpaired/domain_a",
-    folder_b="preprocessed_unpaired/domain_b",
-    patch_size=(32, 192, 192),
-)
-```
-
-### `load_preprocessed_dataset`
-
-For most users, this is the recommended entry point.
-
-- reads `preprocessing_manifest.json`
-- selects the right dataset class automatically
-- applies configuration and split settings automatically
-
-```python
-from medimg_preprocessor import load_preprocessed_dataset
-
-dataset = load_preprocessed_dataset("preprocessed_paired")
-```
-
-### `RawInferencePatchDataset`
-
-- purpose: runtime preprocessing and patch-wise inference on raw images
-- use this for direct inference from NIfTI or similar files
-- requires explicit `patch_size`
-
-```python
-from medimg_preprocessor import PreprocessingConfig, RawInferencePatchDataset
-
-config = PreprocessingConfig()
 dataset = RawInferencePatchDataset(
-    images_dir="raw_cbct",
+    images_dir="raw/images",
     config=config,
     patch_size=(32, 192, 192),
     overlap=0.5,
 )
+loader = DataLoader(dataset, batch_size=2, shuffle=False)
 ```
 
-### `InferencePatchAccumulator`
+patch prediction을 합친 뒤 `save_prediction_nifti`를 사용하면 원본 NIfTI의 affine과
+header를 유지한 결과를 저장할 수 있습니다.
 
-- purpose: merge overlapping patch predictions into one preprocessed-volume prediction
-- overlapping regions are averaged
-- usually used with `RawInferencePatchDataset.build_accumulator(...)`
+## 문제 해결
 
-```python
-acc = dataset.build_accumulator(case_index=0, channels=1)
-acc.add_patch(pred_patch, starts)
-full_pred = acc.finalize()
+### `images and labels must contain the same case identifiers`
+
+image와 target 파일의 case identifier가 일치하지 않는 경우입니다. 파일명과 확장자를
+확인하고, 일부 case가 한쪽에만 있다면 해당 파일을 정리한 뒤 다시 실행하십시오.
+
+### `--image-interpolation-axes` 차원 오류
+
+입력한 보간 방식 개수가 영상의 spatial dimension과 같아야 합니다. 3D 영상이면 세 개,
+2D 영상이면 두 개를 입력해야 합니다.
+
+### Python 3.7에서 `blosc2` 오류
+
+Python 3.7에서는 `blosc2`/`.b2nd`를 사용할 수 없습니다. 다음처럼 `npz`를 지정하십시오.
+
+```bash
+python -m medimg_preprocessor preprocess-dataset \
+  ... \
+  --storage-format npz
 ```
+
+### `_mask`가 저장되지 않음
+
+mask를 patch sampling에 사용하는 것과 mask 파일을 디스크에 저장하는 것은 별개입니다.
+파일도 필요하면 `--save-mask`를 추가하십시오.
