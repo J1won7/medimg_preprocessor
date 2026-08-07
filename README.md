@@ -163,45 +163,34 @@ python -m medimg_preprocessor preprocess-dataset \
 - `--target-mask-threshold`: target 쪽에만 적용
 - `none`: 해당 쪽 threshold mask를 명시적으로 끔
 
-생성된 mask에는 기본적으로 hole filling, largest component 유지, binary closing이
-적용됩니다. 옵션은 다음과 같습니다.
+### 최종 mask/label 후처리
 
-- `--mask-fill-holes` / `--no-mask-fill-holes`
-- `--mask-keep-largest-component` / `--no-mask-keep-largest-component`
-- `--mask-closing-iters N`
-
-경계에 붙은 mask가 closing 과정에서 깎이지 않도록 closing 시 임시 zero padding을
-적용한 뒤 원래 영상 크기로 되돌립니다.
-
-### 리샘플링 후 mask/label 인스턴스 후처리
-
-리샘플링 과정에서 binary mask나 label에 작은 구멍 또는 단절이 생길 수 있습니다.
-이를 선택적으로 보정하려면 다음 옵션을 사용합니다. 기본값은 `none`이므로 기존
-전처리 결과에는 영향을 주지 않습니다.
-
-- `--mask-instance-postprocess`: 리샘플링 후 patch sampling용 binary mask에 적용
-- `--label-instance-postprocess`: 리샘플링 후 label의 각 양수 ID에 독립적으로 적용
-- `--mask-instance-closing-iters N`: mask closing 반복 횟수
-- `--label-instance-closing-iters N`: label closing 반복 횟수
+mask와 label은 모두 최종 spacing으로 리샘플링한 뒤 후처리를 한 번만 적용합니다.
+기본값은 `none`이며, 명시적으로 켠 경우에만 원본 mask/label이 변경됩니다.
 
 후처리 방식은 `none`, `fill_holes`, `closing`, `fill_holes_closing` 중에서 선택합니다.
-`label`은 전체 label map을 하나의 binary mask로 처리하지 않고, 각 ID를 별도 binary
-mask로 변환한 뒤 연산하고 다시 원래 ID로 합칩니다. 원래 다른 인스턴스가 차지하던
-voxel은 보호하며, 후처리로 새로 확장된 영역을 여러 인스턴스가 동시에 차지하려고
-하면 임의의 ID를 선택하지 않고 background로 둡니다.
+
+- `--mask-postprocess`: 최종 binary sampling mask에 적용
+- `--mask-closing-iters N`: mask closing 반복 횟수
+- `--mask-keep-largest-component`: 최종 mask에서 가장 큰 연결 성분만 유지
+- `--label-postprocess`: 각 양수 label ID에 독립적으로 적용
+- `--label-closing-iters N`: label closing 반복 횟수
 
 예를 들어 mask와 label에 각각 hole filling과 closing을 적용하려면 다음과 같이
 실행합니다.
 
 ```bash
---mask-instance-postprocess fill_holes_closing \
---mask-instance-closing-iters 1 \
---label-instance-postprocess fill_holes_closing \
---label-instance-closing-iters 1
+--mask-postprocess fill_holes_closing \
+--mask-closing-iters 1 \
+--label-postprocess fill_holes_closing \
+--label-closing-iters 1
 ```
 
-`fill_holes`는 내부가 의도적으로 비어 있는 구조도 채울 수 있고, `closing`은 객체를
-확장할 수 있습니다. 따라서 데이터의 label 의미에 맞을 때만 활성화하십시오.
+label은 전체 map을 하나의 binary mask로 처리하지 않고, 각 ID를 별도 binary mask로
+변환한 뒤 다시 합칩니다. 원래 label voxel은 보호하며, 새로 확장된 영역이 여러
+instance에 동시에 해당하면 최종 spacing을 반영한 물리적 거리가 가까운 ID를 선택하고,
+거리가 같으면 작은 ID를 선택합니다. `fill_holes`는 의도적인 내부 cavity도 채울 수
+있고, `closing`은 객체를 확장할 수 있으므로 instance label에만 사용하십시오.
 
 ### 저장되는 `_mask` 파일
 

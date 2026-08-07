@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 name = "medimg-preprocessor"
 version = "0.1.0"
 description = "Standalone nnU-Net-style medical image preprocessing for segmentation and generative workflows."
-readme = { file = "medimg_preprocessor/README.md", content-type = "text/markdown" }
+readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.7"
 authors = [
   { name = "J1won7" }

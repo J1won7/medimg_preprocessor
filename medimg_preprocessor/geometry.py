@@ -4,12 +4,18 @@ from typing import Optional, Sequence
 import warnings
 
 import numpy as np
-from scipy.ndimage import binary_closing, binary_fill_holes, generate_binary_structure, label
+from scipy.ndimage import (
+    binary_closing,
+    binary_fill_holes,
+    distance_transform_edt,
+    generate_binary_structure,
+    label,
+)
 from skimage.transform import resize
 
 
 MAX_INTERPOLATION_ORDER = 5
-INSTANCE_POSTPROCESS_CHOICES = (
+POSTPROCESS_CHOICES = (
     "none",
     "fill_holes",
     "closing",
@@ -60,85 +66,65 @@ def ensure_binary_mask(mask: np.ndarray, *, spatial_shape: Sequence[int], name: 
     return np.asarray(reduced != 0, dtype=bool)
 
 
-def postprocess_binary_mask(
-    mask: np.ndarray,
-    *,
-    fill_holes: bool = True,
-    keep_largest_component: bool = True,
-    closing_iters: int = 1,
-) -> np.ndarray:
-    mask = np.asarray(mask, dtype=bool)
-    if fill_holes:
-        mask = binary_fill_holes(mask)
-    if closing_iters > 0:
-        structure = generate_binary_structure(mask.ndim, 1)
-        iterations = int(closing_iters)
-        # Give dilation room to extend beyond the image boundary before the
-        # erosion step. Cropping restores the original field of view.
-        padding = [(iterations, iterations)] * mask.ndim
-        padded_mask = np.pad(mask, padding, mode="constant", constant_values=False)
-        closed_mask = binary_closing(padded_mask, structure=structure, iterations=iterations)
-        crop_slices = tuple(slice(iterations, -iterations) for _ in range(mask.ndim))
-        mask = closed_mask[crop_slices]
-    if keep_largest_component and np.any(mask):
-        structure = generate_binary_structure(mask.ndim, 1)
-        labeled, num = label(mask, structure=structure)
-        if num > 1:
-            component_sizes = np.bincount(labeled.ravel())
-            component_sizes[0] = 0
-            largest = int(np.argmax(component_sizes))
-            mask = labeled == largest
-    if fill_holes:
-        mask = binary_fill_holes(mask)
-    return np.asarray(mask, dtype=bool)
-
-
-def _apply_instance_postprocess(
+def _apply_morphology(
     mask: np.ndarray,
     *,
     operation: str,
     closing_iters: int,
 ) -> np.ndarray:
-    if operation not in INSTANCE_POSTPROCESS_CHOICES:
+    if operation not in POSTPROCESS_CHOICES:
         _fail_validation(
-            f"Unknown instance postprocess operation '{operation}'. "
-            f"Choose one of {INSTANCE_POSTPROCESS_CHOICES}"
+            f"Unknown postprocess operation '{operation}'. "
+            f"Choose one of {POSTPROCESS_CHOICES}"
         )
     iterations = int(closing_iters)
     if iterations < 0:
         _fail_validation(f"closing_iters must be non-negative, got {closing_iters}")
 
     result = np.asarray(mask, dtype=bool)
+    structure = generate_binary_structure(result.ndim, 1)
     use_fill_holes = operation in {"fill_holes", "fill_holes_closing"}
     use_closing = operation in {"closing", "fill_holes_closing"}
     if use_fill_holes:
-        result = binary_fill_holes(result)
+        result = binary_fill_holes(result, structure=structure)
     if use_closing and iterations > 0:
-        structure = generate_binary_structure(result.ndim, 1)
         padding = [(iterations, iterations)] * result.ndim
         padded = np.pad(result, padding, mode="constant", constant_values=False)
         closed = binary_closing(padded, structure=structure, iterations=iterations)
         crop_slices = tuple(slice(iterations, -iterations) for _ in range(result.ndim))
         result = closed[crop_slices]
     if use_fill_holes:
-        result = binary_fill_holes(result)
+        result = binary_fill_holes(result, structure=structure)
     return np.asarray(result, dtype=bool)
 
 
-def postprocess_binary_mask_instance(
+def postprocess_binary_mask(
     mask: np.ndarray,
     *,
     operation: str = "none",
     closing_iters: int = 1,
+    keep_largest_component: bool = False,
 ) -> np.ndarray:
-    """Apply optional morphology to one binary sampling mask after resampling."""
-    if operation == "none":
-        return np.asarray(mask, dtype=bool)
-    return _apply_instance_postprocess(
+    """Apply the single final-stage morphology pass to a binary mask."""
+    mask = np.asarray(mask)
+    if mask.ndim not in (2, 3):
+        _fail_validation(
+            f"mask must be a 2D or 3D array, got shape {mask.shape}"
+        )
+    result = _apply_morphology(
         mask,
         operation=operation,
         closing_iters=closing_iters,
     )
+    if keep_largest_component and np.any(result):
+        structure = generate_binary_structure(result.ndim, 1)
+        labeled, num = label(result, structure=structure)
+        if num > 1:
+            component_sizes = np.bincount(labeled.ravel())
+            component_sizes[0] = 0
+            largest = int(np.argmax(component_sizes))
+            result = labeled == largest
+    return np.asarray(result, dtype=bool)
 
 
 def postprocess_label_instances(
@@ -146,39 +132,51 @@ def postprocess_label_instances(
     *,
     operation: str = "none",
     closing_iters: int = 1,
+    spacing: Optional[Sequence[float]] = None,
 ) -> np.ndarray:
     """Apply morphology independently to each positive label ID.
 
     Original non-background voxels are protected. If multiple processed
-    instances claim the same newly created voxel, that voxel remains background
-    instead of letting iteration order overwrite an instance ID.
+    instances claim the same newly created voxel, the instance with the
+    smallest physical distance to its original mask wins. Ties use the
+    smaller label ID for deterministic output.
     """
-    if operation == "none":
-        return np.asarray(label_map)
-    if operation not in INSTANCE_POSTPROCESS_CHOICES:
-        _fail_validation(
-            f"Unknown instance postprocess operation '{operation}'. "
-            f"Choose one of {INSTANCE_POSTPROCESS_CHOICES}"
-        )
     if not isinstance(label_map, np.ndarray) or label_map.ndim not in (2, 3):
         _fail_validation(
             f"label_map must be a 2D or 3D numpy array, got {getattr(label_map, 'shape', None)}"
         )
     if not np.issubdtype(label_map.dtype, np.number):
         _fail_validation(f"label_map must contain numeric data, got {label_map.dtype}")
+    if operation not in POSTPROCESS_CHOICES:
+        _fail_validation(
+            f"Unknown postprocess operation '{operation}'. "
+            f"Choose one of {POSTPROCESS_CHOICES}"
+        )
+    if operation == "none":
+        return np.asarray(label_map)
     iterations = int(closing_iters)
     if iterations < 0:
         _fail_validation(f"closing_iters must be non-negative, got {closing_iters}")
 
+    sampling = None
+    if spacing is not None:
+        sampling = tuple(float(value) for value in spacing)
+        if len(sampling) != label_map.ndim or any(
+            not np.isfinite(value) or value <= 0 for value in sampling
+        ):
+            _fail_validation(
+                f"spacing must contain {label_map.ndim} finite positive values, got {spacing}"
+            )
+
     original = np.asarray(label_map).copy()
     occupied = original != 0
-    additions = []
-    addition_count = np.zeros(original.shape, dtype=np.uint32)
+    best_distance = np.full(original.shape, np.inf, dtype=np.float64)
+    best_label = np.zeros(original.shape, dtype=original.dtype)
     for label_value in np.unique(original):
         if label_value <= 0:
             continue
         instance = original == label_value
-        processed = _apply_instance_postprocess(
+        processed = _apply_morphology(
             instance,
             operation=operation,
             closing_iters=iterations,
@@ -186,14 +184,24 @@ def postprocess_label_instances(
         # Never overwrite an existing voxel belonging to another label.
         processed &= (~occupied) | instance
         new_voxels = processed & ~occupied
-        addition_count += new_voxels.astype(np.uint32, copy=False)
-        additions.append((label_value, new_voxels))
+        if not np.any(new_voxels):
+            continue
+        distances = distance_transform_edt(~instance, sampling=sampling)
+        better = new_voxels & (
+            (distances < best_distance)
+            | (
+                (distances == best_distance)
+                & ((best_label == 0) | (label_value < best_label))
+            )
+        )
+        best_distance[better] = distances[better]
+        best_label[better] = label_value
 
     result = original.copy()
-    unique_additions = addition_count == 1
-    for label_value, new_voxels in additions:
-        result[new_voxels & unique_additions] = label_value
+    assigned = best_label != 0
+    result[assigned] = best_label[assigned]
     return result
+
 
 def compute_new_shape(
     old_shape: Sequence[int],
