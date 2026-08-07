@@ -7,7 +7,7 @@ import os
 import pickle
 import math
 import sys
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 import warnings
 
 import numpy as np
@@ -28,6 +28,7 @@ except ModuleNotFoundError:
         return None
 
 from .config import PreprocessingConfig
+from .augmentation import NNUNetV2Augmentation
 from .preprocessing import RunStage, TaskMode, TaskPreprocessedCase
 
 
@@ -46,6 +47,54 @@ def _fail_validation(message: str) -> None:
 def _require_torch() -> None:
     if torch is None:
         _fail_validation("torch is required for dataset loading and tensor conversion")
+
+
+def _resolve_augmentation(augmentation):
+    if augmentation is None:
+        return None
+    if isinstance(augmentation, str):
+        if augmentation.lower() in {"nnunet_v2", "nnunetv2"}:
+            return NNUNetV2Augmentation()
+        _fail_validation(
+            f"Unknown augmentation '{augmentation}'. Supported values: 'nnunet_v2'"
+        )
+    if callable(augmentation) or hasattr(augmentation, "apply"):
+        return augmentation
+    _fail_validation(
+        "augmentation must be None, 'nnunet_v2', a callable, or an object with apply()"
+    )
+
+
+def _apply_augmentation(
+    augmentation,
+    sample: Dict,
+    rng: np.random.RandomState,
+    crop_size=None,
+) -> Dict:
+    if augmentation is None:
+        return sample
+    if isinstance(augmentation, NNUNetV2Augmentation):
+        result = augmentation.apply(sample, rng=rng, crop_size=crop_size)
+    elif hasattr(augmentation, "apply"):
+        result = augmentation.apply(sample)
+    else:
+        result = augmentation(sample)
+    if not isinstance(result, dict):
+        _fail_validation(
+            f"augmentation must return a sample dict, got {type(result).__name__}"
+        )
+    if crop_size is not None and not isinstance(augmentation, NNUNetV2Augmentation):
+        for fields, _ in NNUNetV2Augmentation._field_groups(result):
+            group_crop_size = crop_size
+            if isinstance(crop_size, dict):
+                if fields and fields[0] not in crop_size:
+                    _fail_validation(
+                        f"crop_size is missing a value for augmentation group '{fields[0]}'"
+                    )
+                group_crop_size = crop_size.get(fields[0])
+            if group_crop_size is not None:
+                NNUNetV2Augmentation._center_crop_fields(result, fields, group_crop_size)
+    return result
 
 
 def _require_blosc2() -> None:
@@ -874,9 +923,15 @@ def _resolve_patch_size(array: np.ndarray, patch_size: Optional[Sequence[int]], 
     spatial_dims = array.ndim - 1
     _validate_patch_dims(array, patch_size, context)
     if len(patch_size) == spatial_dims:
-        return tuple(int(i) for i in patch_size)
+        resolved = tuple(int(i) for i in patch_size)
+        if any(i <= 0 for i in resolved):
+            _fail_validation(f"{context} requires positive patch dimensions, got {resolved}")
+        return resolved
     if spatial_dims == 3 and len(patch_size) == 2:
-        return (1, int(patch_size[0]), int(patch_size[1]))
+        resolved = (1, int(patch_size[0]), int(patch_size[1]))
+        if any(i <= 0 for i in resolved):
+            _fail_validation(f"{context} requires positive patch dimensions, got {resolved}")
+        return resolved
     _fail_validation(
         f"{context} expects patch_size with {spatial_dims} spatial dims, got {len(patch_size)} "
         f"for array shape {array.shape}"
@@ -939,6 +994,110 @@ def _crop_or_pad(array: np.ndarray, patch_size: Optional[Sequence[int]], rng: np
     for current, wanted in zip(array.shape[1:], target):
         starts.append(0 if current == wanted else int(rng.randint(0, current - wanted + 1)))
     return _squeeze_2d_patch_if_needed(_crop_spatial(array, target, starts), patch_size)
+
+
+def _crop_with_starts_padded(
+    array: np.ndarray,
+    patch_size: Sequence[int],
+    starts: Sequence[int],
+    *,
+    squeeze_patch_size: Optional[Sequence[int]] = None,
+) -> np.ndarray:
+    """Crop a patch while allowing negative starts and padding outside the case."""
+    target = _resolve_patch_size(array, patch_size, "augmented crop/pad")
+    if len(starts) != len(target):
+        _fail_validation(
+            f"augmented crop/pad received {len(starts)} starts for patch_size with {len(target)} dims"
+        )
+    pad_width = [(0, 0)]
+    shifted_starts = []
+    for current, wanted, start in zip(array.shape[1:], target, starts):
+        start = int(start)
+        if start == 0 and wanted > current:
+            # Preserve the historical centered padding for oversized patches.
+            missing = int(wanted) - int(current)
+            before = missing // 2
+            after = missing - before
+        else:
+            before = max(-start, 0)
+            after = max(start + int(wanted) - int(current), 0)
+        pad_width.append((before, after))
+        shifted_starts.append(start + before)
+    if any(before or after for before, after in pad_width):
+        array = np.pad(array, pad_width, mode="constant", constant_values=0)
+    cropped = _crop_spatial(array, target, shifted_starts)
+    return _squeeze_2d_patch_if_needed(cropped, squeeze_patch_size)
+
+
+def _expand_patch_starts(
+    final_starts: Sequence[int],
+    final_patch_size: Sequence[int],
+    initial_patch_size: Sequence[int],
+) -> Tuple[int, ...]:
+    if not (
+        len(final_starts) == len(final_patch_size) == len(initial_patch_size)
+    ):
+        _fail_validation(
+            "initial patch expansion requires matching starts and patch dimensions, got "
+            f"{len(final_starts)}, {len(final_patch_size)}, and {len(initial_patch_size)}"
+        )
+    return tuple(
+        int(start) - (int(initial) - int(final)) // 2
+        for start, final, initial in zip(final_starts, final_patch_size, initial_patch_size)
+    )
+
+
+def _get_initial_patch_size(
+    augmentation,
+    final_patch_size: Sequence[int],
+) -> Tuple[int, ...]:
+    final_patch_size = tuple(int(i) for i in final_patch_size)
+    if augmentation is None:
+        return final_patch_size
+    get_initial = getattr(augmentation, "get_initial_patch_size", None)
+    if not callable(get_initial):
+        return final_patch_size
+    initial_patch_size = tuple(int(i) for i in get_initial(final_patch_size))
+    if len(initial_patch_size) != len(final_patch_size) or any(i <= 0 for i in initial_patch_size):
+        _fail_validation(
+            "augmentation.get_initial_patch_size must return positive values with the same dimensions as "
+            f"the final patch, got {initial_patch_size} for {final_patch_size}"
+        )
+    if any(initial < final for initial, final in zip(initial_patch_size, final_patch_size)):
+        _fail_validation(
+            "augmentation.get_initial_patch_size cannot return a patch smaller than the final patch, got "
+            f"{initial_patch_size} for {final_patch_size}"
+        )
+    return initial_patch_size
+
+
+def _build_patch_plan(
+    array: np.ndarray,
+    patch_size: Optional[Sequence[int]],
+    augmentation,
+    context: str,
+) -> Optional[dict]:
+    if patch_size is None:
+        return None
+    final_array_patch = _resolve_patch_size(array, patch_size, context)
+    squeeze_patch_size = tuple(int(i) for i in patch_size) if array.ndim == 4 and len(patch_size) == 2 else None
+    final_augmentation_patch = (
+        tuple(int(i) for i in final_array_patch[1:])
+        if squeeze_patch_size is not None
+        else tuple(int(i) for i in final_array_patch)
+    )
+    initial_augmentation_patch = _get_initial_patch_size(augmentation, final_augmentation_patch)
+    initial_array_patch = (
+        (1, *initial_augmentation_patch)
+        if squeeze_patch_size is not None
+        else initial_augmentation_patch
+    )
+    return {
+        "final_array_patch": tuple(int(i) for i in final_array_patch),
+        "initial_array_patch": tuple(int(i) for i in initial_array_patch),
+        "final_augmentation_patch": final_augmentation_patch,
+        "squeeze_patch_size": squeeze_patch_size,
+    }
 
 
 def _pad_to_patch_size(array: np.ndarray, patch_size: Sequence[int]) -> np.ndarray:
@@ -1277,6 +1436,7 @@ class TaskPreprocessedDataset(Dataset):
         identifiers: Optional[Sequence[str]] = None,
         patch_size: Optional[Sequence[int]] = None,
         transform: Optional[Callable[[Dict], Dict]] = None,
+        augmentation: Optional[Union[str, Callable[[Dict], Dict]]] = None,
         require_target: bool = False,
         seed: int = 1234,
         patch_foreground_threshold: Optional[float] = None,
@@ -1294,6 +1454,7 @@ class TaskPreprocessedDataset(Dataset):
         if transform is not None and not callable(transform):
             _fail_validation("transform must be callable")
         self.transform = transform
+        self.augmentation = _resolve_augmentation(augmentation)
         self.require_target = require_target
         self.seed = int(seed)
         self.patch_foreground_threshold = (
@@ -1375,11 +1536,36 @@ class TaskPreprocessedDataset(Dataset):
         if self.patch_size is None:
             image = case["image"]
             target = case["target"]
-            starts = None
+            patch_plan = None
         else:
-            starts = self._compute_patch_starts_for_case(case, identifier, rng)
-            image = _crop_with_starts(case["image"], self.patch_size, starts)
-            target = _crop_with_starts(case["target"], self.patch_size, starts) if case["target"] is not None else None
+            patch_plan = _build_patch_plan(
+                case["image"],
+                self.patch_size,
+                self.augmentation,
+                "dataset patch sampling",
+            )
+            final_starts = self._compute_patch_starts_for_case(case, identifier, rng)
+            initial_starts = _expand_patch_starts(
+                final_starts,
+                patch_plan["final_array_patch"],
+                patch_plan["initial_array_patch"],
+            )
+            image = _crop_with_starts_padded(
+                case["image"],
+                patch_plan["initial_array_patch"],
+                initial_starts,
+                squeeze_patch_size=patch_plan["squeeze_patch_size"],
+            )
+            target = (
+                _crop_with_starts_padded(
+                    case["target"],
+                    patch_plan["initial_array_patch"],
+                    initial_starts,
+                    squeeze_patch_size=patch_plan["squeeze_patch_size"],
+                )
+                if case["target"] is not None
+                else None
+            )
         evaluation_reference = case.get("evaluation_reference")
         if evaluation_reference is not None:
             if tuple(case["image"].shape[1:]) != tuple(evaluation_reference.shape[1:]):
@@ -1388,16 +1574,36 @@ class TaskPreprocessedDataset(Dataset):
                     f"{case['image'].shape[1:]} vs {evaluation_reference.shape[1:]}"
                 )
             if self.patch_size is not None:
-                evaluation_reference = _crop_with_starts(evaluation_reference, self.patch_size, starts)
+                evaluation_reference = _crop_with_starts_padded(
+                    evaluation_reference,
+                    patch_plan["initial_array_patch"],
+                    initial_starts,
+                    squeeze_patch_size=patch_plan["squeeze_patch_size"],
+                )
         stored_mask = case.get("mask")
         if stored_mask is not None and self.patch_size is not None:
-            stored_mask = _crop_with_starts(stored_mask[None], self.patch_size, starts)[0]
+            stored_mask = _crop_with_starts_padded(
+                stored_mask[None],
+                patch_plan["initial_array_patch"],
+                initial_starts,
+                squeeze_patch_size=patch_plan["squeeze_patch_size"],
+            )[0]
         conflict_map = case.get("conflict_map")
         if conflict_map is not None and self.patch_size is not None:
-            conflict_map = _crop_with_starts(conflict_map, self.patch_size, starts)
+            conflict_map = _crop_with_starts_padded(
+                conflict_map,
+                patch_plan["initial_array_patch"],
+                initial_starts,
+                squeeze_patch_size=patch_plan["squeeze_patch_size"],
+            )
         artifact_prediction = case.get("artifact_prediction")
         if artifact_prediction is not None and self.patch_size is not None:
-            artifact_prediction = _crop_with_starts(artifact_prediction, self.patch_size, starts)
+            artifact_prediction = _crop_with_starts_padded(
+                artifact_prediction,
+                patch_plan["initial_array_patch"],
+                initial_starts,
+                squeeze_patch_size=patch_plan["squeeze_patch_size"],
+            )
         sample = {
             "image": torch.from_numpy(np.asarray(image)).float(),
             "identifier": identifier,
@@ -1425,6 +1631,12 @@ class TaskPreprocessedDataset(Dataset):
             sample["conflict_map"] = torch.from_numpy(_dequantize_conflict_map(conflict_map)).float()
         if artifact_prediction is not None:
             sample["artifact_pred"] = torch.from_numpy(np.array(artifact_prediction, copy=True)).float()
+        sample = _apply_augmentation(
+            self.augmentation,
+            sample,
+            rng,
+            crop_size=None if patch_plan is None else patch_plan["final_augmentation_patch"],
+        )
         if self.transform is not None:
             sample = self.transform(sample)
         return sample
@@ -1468,6 +1680,7 @@ class UnpairedGenerativeDataset(Dataset):
         identifiers_b: Optional[Sequence[str]] = None,
         patch_size: Optional[Sequence[int]] = None,
         transform: Optional[Callable[[Dict], Dict]] = None,
+        augmentation: Optional[Union[str, Callable[[Dict], Dict]]] = None,
         random_pairing: bool = True,
         seed: int = 1234,
     ):
@@ -1484,6 +1697,7 @@ class UnpairedGenerativeDataset(Dataset):
         if transform is not None and not callable(transform):
             _fail_validation("transform must be callable")
         self.transform = transform
+        self.augmentation = _resolve_augmentation(augmentation)
         self.random_pairing = random_pairing
         self.seed = int(seed)
 
@@ -1500,24 +1714,84 @@ class UnpairedGenerativeDataset(Dataset):
         )
         case_a = load_preprocessed_case(self.folder_a, identifier_a)
         case_b = load_preprocessed_case(self.folder_b, identifier_b)
-        starts_a = _sample_starts_from_locations(case_a, self.patch_size, rng) if self.patch_size is not None else None
-        if starts_a is None and self.patch_size is not None:
-            starts_a = _sample_starts_from_precomputed(case_a, self.patch_size, rng)
-        starts_b = _sample_starts_from_locations(case_b, self.patch_size, rng) if self.patch_size is not None else None
-        if starts_b is None and self.patch_size is not None:
-            starts_b = _sample_starts_from_precomputed(case_b, self.patch_size, rng)
+        patch_plan_a = _build_patch_plan(
+            case_a["image"],
+            self.patch_size,
+            self.augmentation,
+            "unpaired domain A patch sampling",
+        )
+        patch_plan_b = _build_patch_plan(
+            case_b["image"],
+            self.patch_size,
+            self.augmentation,
+            "unpaired domain B patch sampling",
+        )
+        final_starts_a = (
+            _sample_starts_from_locations(case_a, self.patch_size, rng)
+            if self.patch_size is not None
+            else None
+        )
+        if final_starts_a is None and self.patch_size is not None:
+            final_starts_a = _sample_starts_from_precomputed(case_a, self.patch_size, rng)
+        if final_starts_a is None and self.patch_size is not None:
+            final_starts_a = _compute_crop_starts(
+                case_a["image"].shape[1:],
+                patch_plan_a["final_array_patch"],
+                rng,
+            )
+        final_starts_b = (
+            _sample_starts_from_locations(case_b, self.patch_size, rng)
+            if self.patch_size is not None
+            else None
+        )
+        if final_starts_b is None and self.patch_size is not None:
+            final_starts_b = _sample_starts_from_precomputed(case_b, self.patch_size, rng)
+        if final_starts_b is None and self.patch_size is not None:
+            final_starts_b = _compute_crop_starts(
+                case_b["image"].shape[1:],
+                patch_plan_b["final_array_patch"],
+                rng,
+            )
+        initial_starts_a = (
+            _expand_patch_starts(
+                final_starts_a,
+                patch_plan_a["final_array_patch"],
+                patch_plan_a["initial_array_patch"],
+            )
+            if self.patch_size is not None
+            else None
+        )
+        initial_starts_b = (
+            _expand_patch_starts(
+                final_starts_b,
+                patch_plan_b["final_array_patch"],
+                patch_plan_b["initial_array_patch"],
+            )
+            if self.patch_size is not None
+            else None
+        )
         sample = {
             "image_a": torch.from_numpy(
                 np.asarray(
-                    _crop_with_starts(case_a["image"], self.patch_size, starts_a)
-                    if starts_a is not None
+                    _crop_with_starts_padded(
+                        case_a["image"],
+                        patch_plan_a["initial_array_patch"],
+                        initial_starts_a,
+                        squeeze_patch_size=patch_plan_a["squeeze_patch_size"],
+                    )
+                    if self.patch_size is not None
                     else _crop_or_pad(case_a["image"], self.patch_size, rng)
                 )
             ).float(),
             "image_b": torch.from_numpy(
                 np.asarray(
-                    _crop_with_starts(case_b["image"], self.patch_size, starts_b)
-                    if starts_b is not None
+                    _crop_with_starts_padded(
+                        case_b["image"],
+                        patch_plan_b["initial_array_patch"],
+                        initial_starts_b,
+                        squeeze_patch_size=patch_plan_b["squeeze_patch_size"],
+                    )
+                    if self.patch_size is not None
                     else _crop_or_pad(case_b["image"], self.patch_size, rng)
                 )
             ).float(),
@@ -1528,18 +1802,35 @@ class UnpairedGenerativeDataset(Dataset):
         }
         if case_a.get("mask") is not None:
             mask_a = (
-                _crop_with_starts(case_a["mask"][None], self.patch_size, starts_a)[0]
-                if starts_a is not None
+                _crop_with_starts_padded(
+                    case_a["mask"][None],
+                    patch_plan_a["initial_array_patch"],
+                    initial_starts_a,
+                    squeeze_patch_size=patch_plan_a["squeeze_patch_size"],
+                )[0]
+                if self.patch_size is not None
                 else _crop_or_pad(case_a["mask"][None], self.patch_size, rng)[0]
             )
             sample["mask_a"] = torch.from_numpy(np.asarray(mask_a != 0)).bool()
         if case_b.get("mask") is not None:
             mask_b = (
-                _crop_with_starts(case_b["mask"][None], self.patch_size, starts_b)[0]
-                if starts_b is not None
+                _crop_with_starts_padded(
+                    case_b["mask"][None],
+                    patch_plan_b["initial_array_patch"],
+                    initial_starts_b,
+                    squeeze_patch_size=patch_plan_b["squeeze_patch_size"],
+                )[0]
+                if self.patch_size is not None
                 else _crop_or_pad(case_b["mask"][None], self.patch_size, rng)[0]
             )
             sample["mask_b"] = torch.from_numpy(np.asarray(mask_b != 0)).bool()
+        crop_sizes = None
+        if self.patch_size is not None:
+            crop_sizes = {
+                "image_a": patch_plan_a["final_augmentation_patch"],
+                "image_b": patch_plan_b["final_augmentation_patch"],
+            }
+        sample = _apply_augmentation(self.augmentation, sample, rng, crop_size=crop_sizes)
         if self.transform is not None:
             sample = self.transform(sample)
         return sample
@@ -1554,6 +1845,7 @@ def load_preprocessed_dataset(
     configuration: Optional[str] = None,
     split: Optional[str] = None,
     transform: Optional[Callable[[Dict], Dict]] = None,
+    augmentation: Optional[Union[str, Callable[[Dict], Dict]]] = None,
     seed: int = 1234,
     random_pairing: Optional[bool] = None,
     view_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
@@ -1598,6 +1890,7 @@ def load_preprocessed_dataset(
             identifiers_b=identifiers_b,
             patch_size=effective_patch_size,
             transform=transform,
+            augmentation=augmentation,
             random_pairing=manifest.get("random_pairing", True) if random_pairing is None else random_pairing,
             seed=seed,
         )
@@ -1614,6 +1907,7 @@ def load_preprocessed_dataset(
         "identifiers": identifiers,
         "patch_size": effective_patch_size,
         "transform": transform,
+        "augmentation": augmentation,
         "seed": seed,
         "patch_foreground_threshold": patch_foreground_threshold,
         "patch_foreground_min_fraction": patch_foreground_min_fraction,

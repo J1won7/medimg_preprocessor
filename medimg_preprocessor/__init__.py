@@ -1,5 +1,6 @@
 from .cli import medimg_preprocess
 from .config import PreprocessingConfig, ResamplingConfig
+from .augmentation import NNUNetV2Augmentation
 from .normalization import (
     CTNormalization,
     MinMaxClipNormalization,
@@ -82,6 +83,7 @@ __all__ = [
     "medimg_preprocess",
     "PreprocessingConfig",
     "ResamplingConfig",
+    "NNUNetV2Augmentation",
     "CTNormalization",
     "MinMaxClipNormalization",
     "NoNormalization",
