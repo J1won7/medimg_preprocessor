@@ -196,7 +196,7 @@ def _load_config_from_json(path: Optional[str]) -> Optional[PreprocessingConfig]
         ),
         resampling=ResamplingConfig(
             image_order=int(resampling_payload.get("image_order", 3)),
-            image_order_z=int(resampling_payload.get("image_order_z", 0)),
+            image_order_z=int(resampling_payload.get("image_order_z", 1)),
             label_order=int(resampling_payload.get("label_order", 0)),
             label_order_z=int(resampling_payload.get("label_order_z", 0)),
             force_separate_z=resampling_payload.get("force_separate_z", None),
@@ -504,12 +504,20 @@ def _override_resampling_config(
     config: Optional[PreprocessingConfig],
     *,
     spacing: Optional[Sequence[float]],
+    image_order: Optional[int],
+    image_order_z: Optional[int],
     label_order: Optional[int],
     label_order_z: Optional[int],
 ) -> Optional[PreprocessingConfig]:
     if config is None:
         return None
-    if spacing is None and label_order is None and label_order_z is None:
+    if (
+        spacing is None
+        and image_order is None
+        and image_order_z is None
+        and label_order is None
+        and label_order_z is None
+    ):
         return config
 
     next_spacing = config.spacing if spacing is None else tuple(float(i) for i in spacing)
@@ -519,10 +527,14 @@ def _override_resampling_config(
         )
     if any(i <= 0 for i in next_spacing):
         raise ValueError(f"--spacing values must be positive, got {next_spacing}")
+    next_image_order = config.resampling.image_order if image_order is None else int(image_order)
+    next_image_order_z = config.resampling.image_order_z if image_order_z is None else int(image_order_z)
     next_label_order = config.resampling.label_order if label_order is None else int(label_order)
     next_label_order_z = config.resampling.label_order_z if label_order_z is None else int(label_order_z)
-    if next_label_order < 0 or next_label_order_z < 0:
-        raise ValueError("--label-order and --label-order-z must be non-negative")
+    if min(next_image_order, next_image_order_z, next_label_order, next_label_order_z) < 0:
+        raise ValueError(
+            "--image-order, --image-order-z, --label-order, and --label-order-z must be non-negative"
+        )
 
     return PreprocessingConfig(
         spacing=next_spacing,
@@ -533,8 +545,8 @@ def _override_resampling_config(
             str(k): dict(v) for k, v in config.foreground_intensity_properties_per_channel.items()
         },
         resampling=ResamplingConfig(
-            image_order=config.resampling.image_order,
-            image_order_z=config.resampling.image_order_z,
+            image_order=next_image_order,
+            image_order_z=next_image_order_z,
             label_order=next_label_order,
             label_order_z=next_label_order_z,
             force_separate_z=config.resampling.force_separate_z,
@@ -1211,6 +1223,8 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
         config_a = _override_resampling_config(
             config_a,
             spacing=args.spacing,
+            image_order=args.image_order,
+            image_order_z=args.image_order_z,
             label_order=args.label_order,
             label_order_z=args.label_order_z,
         )
@@ -1223,6 +1237,8 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
         config_b = _override_resampling_config(
             config_b,
             spacing=args.spacing,
+            image_order=args.image_order,
+            image_order_z=args.image_order_z,
             label_order=args.label_order,
             label_order_z=args.label_order_z,
         )
@@ -1298,6 +1314,8 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
             base_config = _override_resampling_config(
                 base_config,
                 spacing=args.spacing,
+                image_order=args.image_order,
+                image_order_z=args.image_order_z,
                 label_order=args.label_order,
                 label_order_z=args.label_order_z,
             )
@@ -1357,6 +1375,8 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
             base_config = _override_resampling_config(
                 base_config,
                 spacing=args.spacing,
+                image_order=args.image_order,
+                image_order_z=args.image_order_z,
                 label_order=args.label_order,
                 label_order_z=args.label_order_z,
             )
@@ -1726,6 +1746,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Upper bound used by MinMaxClipNormalization. Requires --normalization-method MinMaxClipNormalization.",
+    )
+    preprocess_parser.add_argument(
+        "--image-order",
+        type=int,
+        default=None,
+        help="Override the in-plane image resampling order. The default is 3 (cubic).",
+    )
+    preprocess_parser.add_argument(
+        "--image-order-z",
+        type=int,
+        default=None,
+        help=(
+            "Override the image resampling order along the low-resolution axis when separate-z resampling is used. "
+            "The default is 1 (linear interpolation)."
+        ),
     )
     preprocess_parser.add_argument(
         "--label-order",

@@ -605,7 +605,7 @@ def plan_preprocessing_from_cases(
         },
         resampling=ResamplingConfig(
             image_order=3,
-            image_order_z=0,
+            image_order_z=1,
             label_order=1,
             label_order_z=0,
             force_separate_z=None,

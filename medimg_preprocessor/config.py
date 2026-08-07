@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Sequence, Union
 @dataclass
 class ResamplingConfig:
     image_order: int = 3
-    image_order_z: int = 0
+    image_order_z: int = 1
     label_order: int = 0
     label_order_z: int = 0
     force_separate_z: Optional[bool] = None
@@ -115,7 +115,7 @@ class PreprocessingConfig:
             ),
             resampling=ResamplingConfig(
                 image_order=int(data_kwargs.get("order", 3)),
-                image_order_z=int(data_kwargs.get("order_z", 0)),
+                image_order_z=int(data_kwargs.get("order_z", 1)),
                 label_order=int(seg_kwargs.get("order", 0)),
                 label_order_z=int(seg_kwargs.get("order_z", 0)),
                 force_separate_z=data_kwargs.get("force_separate_z", None),
