@@ -9,6 +9,12 @@ from skimage.transform import resize
 
 
 MAX_INTERPOLATION_ORDER = 5
+INSTANCE_POSTPROCESS_CHOICES = (
+    "none",
+    "fill_holes",
+    "closing",
+    "fill_holes_closing",
+)
 
 
 def _fail_validation(message: str) -> None:
@@ -85,6 +91,109 @@ def postprocess_binary_mask(
     if fill_holes:
         mask = binary_fill_holes(mask)
     return np.asarray(mask, dtype=bool)
+
+
+def _apply_instance_postprocess(
+    mask: np.ndarray,
+    *,
+    operation: str,
+    closing_iters: int,
+) -> np.ndarray:
+    if operation not in INSTANCE_POSTPROCESS_CHOICES:
+        _fail_validation(
+            f"Unknown instance postprocess operation '{operation}'. "
+            f"Choose one of {INSTANCE_POSTPROCESS_CHOICES}"
+        )
+    iterations = int(closing_iters)
+    if iterations < 0:
+        _fail_validation(f"closing_iters must be non-negative, got {closing_iters}")
+
+    result = np.asarray(mask, dtype=bool)
+    use_fill_holes = operation in {"fill_holes", "fill_holes_closing"}
+    use_closing = operation in {"closing", "fill_holes_closing"}
+    if use_fill_holes:
+        result = binary_fill_holes(result)
+    if use_closing and iterations > 0:
+        structure = generate_binary_structure(result.ndim, 1)
+        padding = [(iterations, iterations)] * result.ndim
+        padded = np.pad(result, padding, mode="constant", constant_values=False)
+        closed = binary_closing(padded, structure=structure, iterations=iterations)
+        crop_slices = tuple(slice(iterations, -iterations) for _ in range(result.ndim))
+        result = closed[crop_slices]
+    if use_fill_holes:
+        result = binary_fill_holes(result)
+    return np.asarray(result, dtype=bool)
+
+
+def postprocess_binary_mask_instance(
+    mask: np.ndarray,
+    *,
+    operation: str = "none",
+    closing_iters: int = 1,
+) -> np.ndarray:
+    """Apply optional morphology to one binary sampling mask after resampling."""
+    if operation == "none":
+        return np.asarray(mask, dtype=bool)
+    return _apply_instance_postprocess(
+        mask,
+        operation=operation,
+        closing_iters=closing_iters,
+    )
+
+
+def postprocess_label_instances(
+    label_map: np.ndarray,
+    *,
+    operation: str = "none",
+    closing_iters: int = 1,
+) -> np.ndarray:
+    """Apply morphology independently to each positive label ID.
+
+    Original non-background voxels are protected. If multiple processed
+    instances claim the same newly created voxel, that voxel remains background
+    instead of letting iteration order overwrite an instance ID.
+    """
+    if operation == "none":
+        return np.asarray(label_map)
+    if operation not in INSTANCE_POSTPROCESS_CHOICES:
+        _fail_validation(
+            f"Unknown instance postprocess operation '{operation}'. "
+            f"Choose one of {INSTANCE_POSTPROCESS_CHOICES}"
+        )
+    if not isinstance(label_map, np.ndarray) or label_map.ndim not in (2, 3):
+        _fail_validation(
+            f"label_map must be a 2D or 3D numpy array, got {getattr(label_map, 'shape', None)}"
+        )
+    if not np.issubdtype(label_map.dtype, np.number):
+        _fail_validation(f"label_map must contain numeric data, got {label_map.dtype}")
+    iterations = int(closing_iters)
+    if iterations < 0:
+        _fail_validation(f"closing_iters must be non-negative, got {closing_iters}")
+
+    original = np.asarray(label_map).copy()
+    occupied = original != 0
+    additions = []
+    addition_count = np.zeros(original.shape, dtype=np.uint32)
+    for label_value in np.unique(original):
+        if label_value <= 0:
+            continue
+        instance = original == label_value
+        processed = _apply_instance_postprocess(
+            instance,
+            operation=operation,
+            closing_iters=iterations,
+        )
+        # Never overwrite an existing voxel belonging to another label.
+        processed &= (~occupied) | instance
+        new_voxels = processed & ~occupied
+        addition_count += new_voxels.astype(np.uint32, copy=False)
+        additions.append((label_value, new_voxels))
+
+    result = original.copy()
+    unique_additions = addition_count == 1
+    for label_value, new_voxels in additions:
+        result[new_voxels & unique_additions] = label_value
+    return result
 
 def compute_new_shape(
     old_shape: Sequence[int],

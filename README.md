@@ -173,6 +173,36 @@ python -m medimg_preprocessor preprocess-dataset \
 경계에 붙은 mask가 closing 과정에서 깎이지 않도록 closing 시 임시 zero padding을
 적용한 뒤 원래 영상 크기로 되돌립니다.
 
+### 리샘플링 후 mask/label 인스턴스 후처리
+
+리샘플링 과정에서 binary mask나 label에 작은 구멍 또는 단절이 생길 수 있습니다.
+이를 선택적으로 보정하려면 다음 옵션을 사용합니다. 기본값은 `none`이므로 기존
+전처리 결과에는 영향을 주지 않습니다.
+
+- `--mask-instance-postprocess`: 리샘플링 후 patch sampling용 binary mask에 적용
+- `--label-instance-postprocess`: 리샘플링 후 label의 각 양수 ID에 독립적으로 적용
+- `--mask-instance-closing-iters N`: mask closing 반복 횟수
+- `--label-instance-closing-iters N`: label closing 반복 횟수
+
+후처리 방식은 `none`, `fill_holes`, `closing`, `fill_holes_closing` 중에서 선택합니다.
+`label`은 전체 label map을 하나의 binary mask로 처리하지 않고, 각 ID를 별도 binary
+mask로 변환한 뒤 연산하고 다시 원래 ID로 합칩니다. 원래 다른 인스턴스가 차지하던
+voxel은 보호하며, 후처리로 새로 확장된 영역을 여러 인스턴스가 동시에 차지하려고
+하면 임의의 ID를 선택하지 않고 background로 둡니다.
+
+예를 들어 mask와 label에 각각 hole filling과 closing을 적용하려면 다음과 같이
+실행합니다.
+
+```bash
+--mask-instance-postprocess fill_holes_closing \
+--mask-instance-closing-iters 1 \
+--label-instance-postprocess fill_holes_closing \
+--label-instance-closing-iters 1
+```
+
+`fill_holes`는 내부가 의도적으로 비어 있는 구조도 채울 수 있고, `closing`은 객체를
+확장할 수 있습니다. 따라서 데이터의 label 의미에 맞을 때만 활성화하십시오.
+
 ### 저장되는 `_mask` 파일
 
 `_mask`는 patch sampling용 mask입니다. normalization에서 사용하는
@@ -205,7 +235,8 @@ python -m medimg_preprocessor preprocess-dataset \
 
 예를 들어 원본 spacing이 `1.5 x 3.0 x 1.5`이고 target이 `1.0 x 1.0 x 1.0`이면,
 각 축의 voxel 수가 각각 약 1.5배, 3배, 1.5배로 변경됩니다. 영상, label, mask 모두
-동일한 shape 변환을 거치며 특정 축만 자동으로 복사하는 separate-z 경로는 사용하지 않습니다.
+동일한 공간축 shape 변환을 거치며, 각 축의 보간 방식은 전체 또는 축별 옵션으로
+명시합니다.
 
 ### 보간 방식 지정
 
@@ -306,7 +337,7 @@ resampling 설정은 다음처럼 저장됩니다.
 - `mask_orders`: 축별 sampling mask 보간 order
 
 보간 order는 `0=nearest`, `1=linear`, `2=quadratic`, `3=cubic`의 의미입니다.
-현재는 특정 축을 z로 간주하는 `image_order_z`, `label_order_z` 설정을 사용하지 않습니다.
+축별 설정을 사용하지 않으면 지정한 하나의 order가 모든 공간축에 적용됩니다.
 
 manifest만 다시 생성해야 하는 경우:
 

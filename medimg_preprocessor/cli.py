@@ -17,6 +17,7 @@ from .dataset import (
     save_preprocessed_case,
     save_preprocessed_dataset,
 )
+from .geometry import INSTANCE_POSTPROCESS_CHOICES
 from .planning import plan_preprocessing_from_cases
 from .preprocessing import RunStage, TaskMode
 
@@ -868,6 +869,10 @@ def _preprocess_case(
     mask_fill_holes: bool = True,
     mask_keep_largest_component: bool = True,
     mask_closing_iters: int = 1,
+    mask_instance_postprocess: str = "none",
+    mask_instance_closing_iters: int = 1,
+    label_instance_postprocess: str = "none",
+    label_instance_closing_iters: int = 1,
 ) -> None:
     from .preprocessing import TaskAwarePreprocessor
 
@@ -905,6 +910,10 @@ def _preprocess_case(
         mask_fill_holes=mask_fill_holes,
         mask_keep_largest_component=mask_keep_largest_component,
         mask_closing_iters=mask_closing_iters,
+        mask_instance_postprocess=mask_instance_postprocess,
+        mask_instance_closing_iters=mask_instance_closing_iters,
+        label_instance_postprocess=label_instance_postprocess,
+        label_instance_closing_iters=label_instance_closing_iters,
     )
     save_preprocessed_case(
         case,
@@ -976,6 +985,10 @@ def _preprocess_segmentation_or_self_supervised(
                 "mask_fill_holes": args.mask_fill_holes,
                 "mask_keep_largest_component": args.mask_keep_largest_component,
                 "mask_closing_iters": args.mask_closing_iters,
+                "mask_instance_postprocess": args.mask_instance_postprocess,
+                "mask_instance_closing_iters": args.mask_instance_closing_iters,
+                "label_instance_postprocess": args.label_instance_postprocess,
+                "label_instance_closing_iters": args.label_instance_closing_iters,
             }
             for identifier in identifiers
         ]
@@ -1039,6 +1052,10 @@ def _preprocess_segmentation_or_self_supervised(
             "mask_fill_holes": args.mask_fill_holes,
             "mask_keep_largest_component": args.mask_keep_largest_component,
             "mask_closing_iters": args.mask_closing_iters,
+            "mask_instance_postprocess": args.mask_instance_postprocess,
+            "mask_instance_closing_iters": args.mask_instance_closing_iters,
+            "label_instance_postprocess": args.label_instance_postprocess,
+            "label_instance_closing_iters": args.label_instance_closing_iters,
         }
         for identifier in identifiers
     ]
@@ -1121,6 +1138,10 @@ def _preprocess_paired(
             "mask_fill_holes": args.mask_fill_holes,
             "mask_keep_largest_component": args.mask_keep_largest_component,
             "mask_closing_iters": args.mask_closing_iters,
+            "mask_instance_postprocess": args.mask_instance_postprocess,
+            "mask_instance_closing_iters": args.mask_instance_closing_iters,
+            "label_instance_postprocess": args.label_instance_postprocess,
+            "label_instance_closing_iters": args.label_instance_closing_iters,
         }
         for identifier in identifiers
     ]
@@ -1198,6 +1219,10 @@ def _preprocess_unpaired(
             "mask_fill_holes": args.mask_fill_holes,
             "mask_keep_largest_component": args.mask_keep_largest_component,
             "mask_closing_iters": args.mask_closing_iters,
+            "mask_instance_postprocess": args.mask_instance_postprocess,
+            "mask_instance_closing_iters": args.mask_instance_closing_iters,
+            "label_instance_postprocess": args.label_instance_postprocess,
+            "label_instance_closing_iters": args.label_instance_closing_iters,
         }
         for identifier in identifiers_a
     ]
@@ -1226,6 +1251,10 @@ def _preprocess_unpaired(
             "mask_fill_holes": args.mask_fill_holes,
             "mask_keep_largest_component": args.mask_keep_largest_component,
             "mask_closing_iters": args.mask_closing_iters,
+            "mask_instance_postprocess": args.mask_instance_postprocess,
+            "mask_instance_closing_iters": args.mask_instance_closing_iters,
+            "label_instance_postprocess": args.label_instance_postprocess,
+            "label_instance_closing_iters": args.label_instance_closing_iters,
         }
         for identifier in identifiers_b
     ]
@@ -1258,6 +1287,10 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
         raise ValueError("Use both --ct-clip-min and --ct-clip-max together")
     if args.ct_clip_min is not None and args.ct_clip_min >= args.ct_clip_max:
         raise ValueError("--ct-clip-min must be smaller than --ct-clip-max")
+    if args.mask_instance_closing_iters < 0:
+        raise ValueError("--mask-instance-closing-iters must be non-negative")
+    if args.label_instance_closing_iters < 0:
+        raise ValueError("--label-instance-closing-iters must be non-negative")
     _resolve_normalization_method(args.normalization_method)
     _log_stage(1, total_steps, "Scan dataset", f"task_mode={args.task_mode}")
     base_config = _load_config(args.config_json, args.plans_file, args.configuration_name)
@@ -1780,6 +1813,36 @@ def build_parser() -> argparse.ArgumentParser:
         help_text="Keep only the largest connected component in the generated mask. Default: true",
     )
     masking_group.add_argument("--mask-closing-iters", type=int, default=1, help="Binary closing iterations applied to generated masks. Default: 1")
+    masking_group.add_argument(
+        "--mask-instance-postprocess",
+        choices=INSTANCE_POSTPROCESS_CHOICES,
+        default="none",
+        help=(
+            "Apply morphology to the binary sampling mask after resampling. "
+            "Default: none."
+        ),
+    )
+    masking_group.add_argument(
+        "--mask-instance-closing-iters",
+        type=int,
+        default=1,
+        help="Closing iterations for --mask-instance-postprocess. Default: 1",
+    )
+    masking_group.add_argument(
+        "--label-instance-postprocess",
+        choices=INSTANCE_POSTPROCESS_CHOICES,
+        default="none",
+        help=(
+            "Apply morphology independently to each positive label ID after resampling. "
+            "Default: none."
+        ),
+    )
+    masking_group.add_argument(
+        "--label-instance-closing-iters",
+        type=int,
+        default=1,
+        help="Closing iterations for --label-instance-postprocess. Default: 1",
+    )
     masking_group.add_argument(
         "--patch-mask-min-fraction",
         type=float,

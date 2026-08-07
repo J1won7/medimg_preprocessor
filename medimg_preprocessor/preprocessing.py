@@ -13,6 +13,8 @@ from .geometry import (
     create_threshold_mask,
     ensure_binary_mask,
     postprocess_binary_mask,
+    postprocess_binary_mask_instance,
+    postprocess_label_instances,
     resample_array,
 )
 from .normalization import get_normalizer
@@ -44,6 +46,10 @@ class ModularPreprocessingSettings:
     resample: bool = True
     keep_target: Optional[bool] = None
     collect_foreground_locations: Optional[bool] = None
+    mask_instance_postprocess: str = "none"
+    mask_instance_closing_iters: int = 1
+    label_instance_postprocess: str = "none"
+    label_instance_closing_iters: int = 1
 
     @classmethod
     def segmentation_defaults(cls) -> "ModularPreprocessingSettings":
@@ -366,6 +372,26 @@ class ModularPreprocessor:
         else:
             properties["spacing_after_resampling"] = spacing
             properties["shape_after_resampling"] = image.shape[1:]
+
+        if settings.mask_instance_postprocess != "none":
+            patch_sampling_mask = postprocess_binary_mask_instance(
+                patch_sampling_mask,
+                operation=settings.mask_instance_postprocess,
+                closing_iters=settings.mask_instance_closing_iters,
+            )
+        if target_is_segmentation and target is not None:
+            if settings.label_instance_postprocess != "none":
+                target = postprocess_label_instances(
+                    target[0],
+                    operation=settings.label_instance_postprocess,
+                    closing_iters=settings.label_instance_closing_iters,
+                )[None]
+                if patch_sampling_target is not None:
+                    patch_sampling_target = postprocess_label_instances(
+                        patch_sampling_target[0],
+                        operation=settings.label_instance_postprocess,
+                        closing_iters=settings.label_instance_closing_iters,
+                    )[None]
 
         if target is not None and settings.collect_foreground_locations and target_is_segmentation:
             properties["class_locations"] = self._sample_foreground_locations(target)
@@ -770,6 +796,10 @@ class TaskAwarePreprocessor:
         mask_fill_holes: bool = True,
         mask_keep_largest_component: bool = True,
         mask_closing_iters: int = 1,
+        mask_instance_postprocess: Optional[str] = None,
+        mask_instance_closing_iters: Optional[int] = None,
+        label_instance_postprocess: Optional[str] = None,
+        label_instance_closing_iters: Optional[int] = None,
     ) -> TaskPreprocessedCase:
         if not hasattr(image_reader, "read_images"):
             _fail_validation("image_reader must provide a read_images(image_fnames) method")
@@ -843,6 +873,21 @@ class TaskAwarePreprocessor:
                 fill_holes=bool(mask_fill_holes),
                 keep_largest_component=bool(mask_keep_largest_component),
                 closing_iters=int(mask_closing_iters),
+            )
+
+        settings_overrides = {}
+        if mask_instance_postprocess is not None:
+            settings_overrides["mask_instance_postprocess"] = mask_instance_postprocess
+        if mask_instance_closing_iters is not None:
+            settings_overrides["mask_instance_closing_iters"] = int(mask_instance_closing_iters)
+        if label_instance_postprocess is not None:
+            settings_overrides["label_instance_postprocess"] = label_instance_postprocess
+        if label_instance_closing_iters is not None:
+            settings_overrides["label_instance_closing_iters"] = int(label_instance_closing_iters)
+        if settings_overrides:
+            image_settings = replace(
+                image_settings or ModularPreprocessingSettings(),
+                **settings_overrides,
             )
 
         return self.run_task_case(
