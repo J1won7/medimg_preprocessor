@@ -545,28 +545,63 @@ python -m medimg_preprocessor show-manifest --help
 
 ## Sliding-window inference
 
-원본 영상에서 runtime preprocessing과 patch inference를 수행할 때는
-`RawInferencePatchDataset`를 사용합니다.
+전처리된 `.b2nd`를 추론 입력으로 사용할 필요는 없습니다. 학습 전처리 결과 폴더의
+`preprocessing_manifest.json`을 읽어, 새 원본 `nii.gz`에 **동일한 spacing, transpose,
+normalization, resampling 설정**을 적용하는 `ManifestInferencePatchDataset`를 사용하십시오.
+manifest에 저장된 기본 patch 계획도 자동으로 사용합니다.
 
 ```python
+import torch
 from torch.utils.data import DataLoader
-from medimg_preprocessor import PreprocessingConfig, RawInferencePatchDataset
+from medimg_preprocessor import ManifestInferencePatchDataset
 
-config = PreprocessingConfig(
-    spacing=(1.0, 1.0, 1.0),
-    transpose_forward=(0, 1, 2),
-    normalization_schemes=("ZScoreNormalization",),
-    use_mask_for_norm=(False,),
-)
-
-dataset = RawInferencePatchDataset(
-    images_dir="raw/images",
-    config=config,
-    patch_size=(32, 192, 192),
+dataset = ManifestInferencePatchDataset(
+    preprocessed_folder="preprocessed_train",
+    images_dir="raw/imagesTs",  # 단일 .nii.gz 파일도 가능
     overlap=0.5,
 )
 loader = DataLoader(dataset, batch_size=2, shuffle=False)
+accumulators = dataset.build_accumulators(channels=1)
+
+model.eval()
+with torch.no_grad():
+    for batch in loader:
+        prediction = model(batch["image"].cuda())
+        dataset.accumulate_batch(
+            accumulators,
+            prediction,
+            batch["case_index"],
+            batch["starts"],
+        )
+
+for case_index, accumulator in enumerate(accumulators):
+    preprocessed_prediction = accumulator.finalize()
+    dataset.save_prediction_nifti(
+        preprocessed_prediction,
+        case_index,
+        f"predictions/{dataset.get_case(case_index).identifier}.nii.gz",
+    )
 ```
+
+`segmentation` manifest는 `save_prediction_nifti`에서 label용 resampling을 자동 적용하며
+normalization을 역변환하지 않습니다. 모델 출력이 class logits이면 먼저 `argmax`로 label map을
+만드십시오. generative task는 image resampling과 normalization 역변환을 적용합니다.
+
+unpaired manifest는 입력 domain을 반드시 지정해야 합니다.
+
+```python
+dataset = ManifestInferencePatchDataset(
+    preprocessed_folder="preprocessed_unpaired",
+    images_dir="raw/domain_a_test",
+    domain="a",
+)
+```
+
+새 manifest는 전처리 때의 reader와 `--multi-image` 설정도 자동으로 재사용합니다. 이 정보가 없는
+기존 manifest는 `auto` reader와 single-channel을 사용하므로, 필요하면 `image_reader=` 또는
+`multi_image=`로 명시하십시오. manifest에 patch 계획이 없는 기존 데이터는 전처리된 영상 전체를
+하나의 patch로 처리합니다. 수동 설정이 필요한 경우에는 기존
+`RawInferencePatchDataset`에 `PreprocessingConfig`와 `patch_size`를 직접 전달할 수 있습니다.
 
 ## 문제 해결
 

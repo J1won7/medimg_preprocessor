@@ -33,6 +33,7 @@ from .planning import (
 )
 from .inference import (
     InferencePatchAccumulator,
+    ManifestInferencePatchDataset,
     RawInferenceCase,
     RawInferencePatchDataset,
 )
@@ -106,6 +107,7 @@ __all__ = [
     "extract_fingerprint_from_cases",
     "plan_preprocessing_from_cases",
     "InferencePatchAccumulator",
+    "ManifestInferencePatchDataset",
     "RawInferenceCase",
     "RawInferencePatchDataset",
 ]

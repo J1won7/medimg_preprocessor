@@ -17,7 +17,8 @@ except ModuleNotFoundError:
     class Dataset:
         pass
 
-from .config import PreprocessingConfig
+from .config import PreprocessingConfig, ResamplingConfig
+from .dataset import load_preprocessed_dataset_manifest
 from .geometry import resample_array
 from .imageio import (
     NaturalImage2DIO,
@@ -91,6 +92,12 @@ def _build_reader(reader_name: str, example_file: str):
 
 def _scan_image_dir(folder: str, multi_image: bool = False) -> dict[str, list[str]]:
     root = Path(folder)
+    if root.is_file():
+        if multi_image:
+            _fail_validation("multi_image=True requires a directory containing all channel files")
+        if _detect_file_ending(root.name) not in SUPPORTED_SCAN_ENDINGS:
+            _fail_validation(f"Unsupported image file: {folder}")
+        return {_strip_known_suffix(root.name): [str(root)]}
     if not root.is_dir():
         _fail_validation(f"Image directory does not exist: {folder}")
     files = [path for path in root.rglob("*") if path.is_file() and _detect_file_ending(path.name) in SUPPORTED_SCAN_ENDINGS]
@@ -124,6 +131,94 @@ def _resolve_patch_size(array: np.ndarray, patch_size: Sequence[int], context: s
         f"{context} expects patch_size with {spatial_dims} spatial dims, got {len(patch_size)} "
         f"for array shape {array.shape}"
     )
+
+
+def _config_from_manifest_payload(payload: Any) -> PreprocessingConfig:
+    if not isinstance(payload, dict):
+        _fail_validation("Manifest does not contain a preprocessing_config mapping")
+    required_fields = (
+        "spacing",
+        "transpose_forward",
+        "normalization_schemes",
+        "use_mask_for_norm",
+    )
+    missing = [field for field in required_fields if field not in payload]
+    if missing:
+        _fail_validation(
+            "Manifest preprocessing_config is missing required fields: " + ", ".join(missing)
+        )
+    resampling_payload = payload.get("resampling", {})
+    if not isinstance(resampling_payload, dict):
+        _fail_validation("Manifest preprocessing_config.resampling must be a mapping")
+    try:
+        resampling = ResamplingConfig(
+            image_order=resampling_payload.get("image_order", 3),
+            image_orders=resampling_payload.get("image_orders"),
+            label_order=resampling_payload.get("label_order", 0),
+            label_orders=resampling_payload.get("label_orders"),
+            mask_order=resampling_payload.get("mask_order", 0),
+            mask_orders=resampling_payload.get("mask_orders"),
+        )
+        return PreprocessingConfig(
+            spacing=payload["spacing"],
+            transpose_forward=payload["transpose_forward"],
+            normalization_schemes=payload["normalization_schemes"],
+            use_mask_for_norm=payload["use_mask_for_norm"],
+            foreground_intensity_properties_per_channel=payload.get(
+                "foreground_intensity_properties_per_channel", {}
+            ),
+            resampling=resampling,
+        )
+    except (TypeError, ValueError) as error:
+        _fail_validation(f"Invalid preprocessing_config in manifest: {error}")
+
+
+def _patch_size_from_manifest(manifest: dict, configuration: Optional[str]) -> Optional[tuple[int, ...]]:
+    configurations = manifest.get("configurations") or {}
+    selected_configuration = configuration or manifest.get("default_configuration")
+    if selected_configuration is not None:
+        if selected_configuration not in configurations:
+            _fail_validation(
+                f"Configuration '{selected_configuration}' was not found in the preprocessing manifest"
+            )
+        patch_size = configurations[selected_configuration].get("patch_size")
+        if patch_size is not None:
+            return tuple(int(value) for value in patch_size)
+    elif len(configurations) == 1:
+        only_configuration = next(iter(configurations.values()))
+        patch_size = only_configuration.get("patch_size")
+        if patch_size is not None:
+            return tuple(int(value) for value in patch_size)
+
+    patch_size = manifest.get("default_patch_size")
+    if patch_size is None:
+        return None
+    return tuple(int(value) for value in patch_size)
+
+
+def _manifest_config_and_task(
+    manifest: dict,
+    domain: Optional[str],
+) -> tuple[PreprocessingConfig, str, Optional[str]]:
+    task_mode = manifest["task_mode"]
+    dataset_kind = manifest["dataset_kind"]
+    if task_mode == TaskMode.SELF_SUPERVISED:
+        _fail_validation("self_supervised manifests cannot be used for inference")
+    if dataset_kind == "single_folder":
+        if domain is not None:
+            _fail_validation("domain is only valid for unpaired_generative manifests")
+        return _config_from_manifest_payload(manifest.get("preprocessing_config")), task_mode, None
+    if dataset_kind != "unpaired_domains":
+        _fail_validation(f"Unsupported manifest dataset_kind '{dataset_kind}'")
+    if domain is None:
+        _fail_validation("unpaired_generative inference requires domain='a' or domain='b'")
+    domain = str(domain).lower()
+    if domain not in {"a", "b"}:
+        _fail_validation(f"domain must be 'a' or 'b', got '{domain}'")
+    domain_payload = manifest["domains"].get(domain)
+    if not isinstance(domain_payload, dict):
+        _fail_validation(f"Manifest does not contain domain '{domain}'")
+    return _config_from_manifest_payload(domain_payload.get("preprocessing_config")), task_mode, domain
 
 
 def _pad_to_patch_size(array: np.ndarray, patch_size: Sequence[int]) -> np.ndarray:
@@ -165,6 +260,18 @@ def _compute_patch_starts(spatial_shape: Sequence[int], patch_size: Sequence[int
     return [tuple(int(axis_values[idx]) for axis_values, idx in zip(axes, indices)) for indices in np.ndindex(*(len(a) for a in axes))]
 
 
+def _output_starts_for_padded_input(
+    spatial_shape: Sequence[int],
+    patch_size: Sequence[int],
+    input_starts: Sequence[Sequence[int]],
+) -> list[tuple[int, ...]]:
+    padding_before = [max(int(patch) - int(size), 0) // 2 for size, patch in zip(spatial_shape, patch_size)]
+    return [
+        tuple(int(start) - int(before) for start, before in zip(starts, padding_before))
+        for starts in input_starts
+    ]
+
+
 def _inverse_normalize_channel(image: np.ndarray, scheme: str, stats: dict) -> np.ndarray:
     eps = 1e-8
     image = image.astype(np.float32, copy=False)
@@ -196,18 +303,25 @@ def _inverse_normalize_prediction(pred: np.ndarray, config: PreprocessingConfig)
     return restored
 
 
-def _undo_preprocessing(pred: np.ndarray, properties: Dict[str, Any], config: PreprocessingConfig) -> np.ndarray:
+def _undo_preprocessing(
+    pred: np.ndarray,
+    properties: Dict[str, Any],
+    config: PreprocessingConfig,
+    *,
+    resampling_role: str = "image",
+    is_segmentation: bool = False,
+) -> np.ndarray:
     restored = pred.astype(np.float32, copy=False)
     settings = properties.get("medimg_preprocessor_settings", {})
 
     if settings.get("resample", True):
         shape_before_resampling = tuple(int(i) for i in properties["shape_before_resampling"])
-        image_orders = config.resampling.orders_for("image", restored.ndim - 1)
+        orders = config.resampling.orders_for(resampling_role, restored.ndim - 1)
         restored = resample_array(
             restored,
             shape_before_resampling,
-            is_seg=False,
-            orders=image_orders,
+            is_seg=is_segmentation,
+            orders=orders,
         )
 
     if settings.get("transpose", True):
@@ -223,12 +337,24 @@ def _save_nifti_like_reference(volume: np.ndarray, reference_path: Union[str, Pa
     except ModuleNotFoundError:
         _fail_validation("nibabel is required to save NIfTI inference outputs")
     reference = nib.load(str(reference_path))
-    data = volume[0].transpose((2, 1, 0)).astype(np.float32, copy=False)
+    volume = np.asarray(volume)
+    if volume.ndim == 4:
+        data = volume.transpose((3, 2, 1, 0))
+        if volume.shape[0] == 1:
+            data = data[..., 0]
+    elif volume.ndim == 3:
+        data = volume.transpose((2, 1, 0))
+        if volume.shape[0] == 1:
+            data = data[..., 0]
+    else:
+        _fail_validation(f"NIfTI export expects a 2D or 3D channel-first volume, got {volume.shape}")
+    data = data.astype(np.float32, copy=False)
     header = reference.header.copy()
     header.set_data_dtype(np.float32)
     image = nib.Nifti1Image(data, affine=reference.affine, header=header)
     image.set_qform(reference.get_qform(), code=int(reference.header["qform_code"]))
     image.set_sform(reference.get_sform(), code=int(reference.header["sform_code"]))
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     nib.save(image, str(output_path))
 
 
@@ -240,6 +366,7 @@ class RawInferenceCase:
     properties: dict
     patch_size: tuple[int, ...]
     patch_starts: list[tuple[int, ...]]
+    output_starts: list[tuple[int, ...]]
 
 
 class InferencePatchAccumulator:
@@ -253,9 +380,30 @@ class InferencePatchAccumulator:
         patch = np.asarray(patch, dtype=np.float32)
         if patch.ndim == len(self.spatial_shape):
             patch = patch[None]
-        slices = tuple(slice(int(s), int(s) + int(size)) for s, size in zip(starts, patch.shape[1:]))
-        self.value_sum[(slice(None),) + slices] += patch
-        self.value_count[(slice(None),) + slices] += 1.0
+        if patch.ndim != len(self.spatial_shape) + 1:
+            _fail_validation(
+                f"patch must have {len(self.spatial_shape) + 1} dimensions including channels, got {patch.shape}"
+            )
+        if patch.shape[0] != self.channels:
+            _fail_validation(f"patch has {patch.shape[0]} channels, accumulator expects {self.channels}")
+        if len(starts) != len(self.spatial_shape):
+            _fail_validation("starts must have the same dimensionality as the accumulator spatial shape")
+
+        destination_slices = []
+        source_slices = []
+        for start, patch_length, spatial_length in zip(starts, patch.shape[1:], self.spatial_shape):
+            start = int(start)
+            source_start = max(0, -start)
+            destination_start = max(0, start)
+            length = min(int(patch_length) - source_start, int(spatial_length) - destination_start)
+            if length <= 0:
+                return
+            source_slices.append(slice(source_start, source_start + length))
+            destination_slices.append(slice(destination_start, destination_start + length))
+        destination = (slice(None),) + tuple(destination_slices)
+        source = (slice(None),) + tuple(source_slices)
+        self.value_sum[destination] += patch[source]
+        self.value_count[(slice(None),) + tuple(destination_slices)] += 1.0
 
     def finalize(self) -> np.ndarray:
         return self.value_sum / np.clip(self.value_count, 1e-8, None)
@@ -266,24 +414,29 @@ class RawInferencePatchDataset(Dataset):
         self,
         images_dir: str,
         config: PreprocessingConfig,
-        patch_size: Sequence[int],
+        patch_size: Optional[Sequence[int]],
         *,
         overlap: float = 0.5,
         image_reader: str = "auto",
         multi_image: bool = False,
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        task_mode: str = TaskMode.PAIRED_GENERATIVE,
     ):
         _require_torch()
-        if patch_size is None or len(tuple(patch_size)) == 0:
-            _fail_validation("RawInferencePatchDataset requires an explicit non-empty patch_size")
+        if patch_size is not None and len(tuple(patch_size)) == 0:
+            _fail_validation("patch_size must be non-empty when provided")
         if not (0.0 <= float(overlap) < 1.0):
             _fail_validation(f"overlap must be in [0, 1), got {overlap}")
+        if task_mode == TaskMode.SELF_SUPERVISED:
+            _fail_validation("self_supervised does not support inference")
         self.images_dir = str(images_dir)
         self.config = config
         self.overlap = float(overlap)
         self.image_reader_name = str(image_reader)
         self.multi_image = bool(multi_image)
         self.transform = transform
+        self.task_mode = str(task_mode)
+        self.requested_patch_size = None if patch_size is None else tuple(int(value) for value in patch_size)
         self.preprocessor = TaskAwarePreprocessor(config, verbose=False)
 
         grouped = _scan_image_dir(self.images_dir, self.multi_image)
@@ -295,11 +448,20 @@ class RawInferencePatchDataset(Dataset):
             case = self.preprocessor.run_task_case_from_files(
                 image_files=image_files,
                 image_reader=reader,
-                task_mode=TaskMode.PAIRED_GENERATIVE,
+                task_mode=self.task_mode,
                 run_stage=RunStage.PREDICT,
             )
-            resolved_patch_size = _resolve_patch_size(case.image, patch_size, "raw inference")
+            resolved_patch_size = (
+                tuple(int(value) for value in case.image.shape[1:])
+                if self.requested_patch_size is None
+                else _resolve_patch_size(case.image, self.requested_patch_size, "raw inference")
+            )
             patch_starts = _compute_patch_starts(case.image.shape[1:], resolved_patch_size, self.overlap)
+            output_starts = _output_starts_for_padded_input(
+                case.image.shape[1:],
+                resolved_patch_size,
+                patch_starts,
+            )
             case_record = RawInferenceCase(
                 identifier=identifier,
                 image_files=list(image_files),
@@ -307,6 +469,7 @@ class RawInferencePatchDataset(Dataset):
                 properties=case.properties,
                 patch_size=resolved_patch_size,
                 patch_starts=patch_starts,
+                output_starts=output_starts,
             )
             case_index = len(self.cases)
             self.cases.append(case_record)
@@ -318,14 +481,16 @@ class RawInferencePatchDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, Any]:
         case_index, patch_index = self.index_map[index]
         case = self.cases[case_index]
-        starts = case.patch_starts[patch_index]
-        image = _crop_with_starts(case.image, case.patch_size, starts)
+        input_starts = case.patch_starts[patch_index]
+        starts = case.output_starts[patch_index]
+        image = _crop_with_starts(case.image, case.patch_size, input_starts)
         sample: Dict[str, Any] = {
             "image": torch.from_numpy(np.asarray(image)).float(),
             "identifier": case.identifier,
             "case_index": int(case_index),
             "patch_index": int(patch_index),
             "starts": torch.as_tensor(starts, dtype=torch.long),
+            "input_starts": torch.as_tensor(input_starts, dtype=torch.long),
             "patch_size": torch.as_tensor(case.patch_size, dtype=torch.long),
         }
         if self.transform is not None:
@@ -339,17 +504,115 @@ class RawInferencePatchDataset(Dataset):
         case = self.get_case(case_index)
         return InferencePatchAccumulator(case.image.shape[1:], channels=channels)
 
-    def restore_prediction(self, prediction: np.ndarray, case_index: int) -> np.ndarray:
+    def build_accumulators(self, channels: int = 1) -> list[InferencePatchAccumulator]:
+        return [self.build_accumulator(case_index, channels=channels) for case_index in range(len(self.cases))]
+
+    def accumulate_batch(
+        self,
+        accumulators: Sequence[InferencePatchAccumulator],
+        predictions: Any,
+        case_indices: Sequence[int],
+        starts: Sequence[Sequence[int]],
+    ) -> None:
+        if len(accumulators) != len(self.cases):
+            _fail_validation(f"Expected {len(self.cases)} accumulators, got {len(accumulators)}")
+        if torch is not None and isinstance(predictions, torch.Tensor):
+            predictions = predictions.detach().cpu().numpy()
+        predictions = np.asarray(predictions)
+        if predictions.ndim < 2:
+            _fail_validation("predictions must have a batch dimension and at least one spatial dimension")
+        if torch is not None and isinstance(case_indices, torch.Tensor):
+            case_indices = case_indices.detach().cpu().numpy()
+        if torch is not None and isinstance(starts, torch.Tensor):
+            starts = starts.detach().cpu().numpy()
+        if len(predictions) != len(case_indices) or len(predictions) != len(starts):
+            _fail_validation("predictions, case_indices, and starts must have the same batch length")
+        for prediction, case_index, patch_starts in zip(predictions, case_indices, starts):
+            case_index = int(case_index)
+            if case_index < 0 or case_index >= len(self.cases):
+                _fail_validation(f"Invalid case_index {case_index}")
+            accumulators[case_index].add_patch(prediction, patch_starts)
+
+    def restore_prediction(
+        self,
+        prediction: np.ndarray,
+        case_index: int,
+        *,
+        prediction_kind: Optional[str] = None,
+    ) -> np.ndarray:
         case = self.get_case(case_index)
-        denormalized = _inverse_normalize_prediction(np.asarray(prediction), self.config)
-        return _undo_preprocessing(denormalized, case.properties, self.config)
+        if prediction_kind is None:
+            prediction_kind = "label" if self.task_mode == TaskMode.SEGMENTATION else "image"
+        prediction_kind = str(prediction_kind).lower()
+        if prediction_kind == "image":
+            restored = _inverse_normalize_prediction(np.asarray(prediction), self.config)
+            return _undo_preprocessing(restored, case.properties, self.config)
+        if prediction_kind == "label":
+            return _undo_preprocessing(
+                np.asarray(prediction),
+                case.properties,
+                self.config,
+                resampling_role="label",
+                is_segmentation=True,
+            )
+        _fail_validation("prediction_kind must be 'image' or 'label'")
 
     def save_prediction_nifti(
         self,
         prediction: np.ndarray,
         case_index: int,
         output_path: Union[str, Path],
+        *,
+        prediction_kind: Optional[str] = None,
     ) -> None:
         case = self.get_case(case_index)
-        restored = self.restore_prediction(prediction, case_index)
+        restored = self.restore_prediction(prediction, case_index, prediction_kind=prediction_kind)
         _save_nifti_like_reference(restored, case.image_files[0], output_path)
+
+
+class ManifestInferencePatchDataset(RawInferencePatchDataset):
+    """Run manifest-matched preprocessing and sliding-window patch inference on raw images."""
+
+    def __init__(
+        self,
+        preprocessed_folder: str,
+        images_dir: str,
+        *,
+        patch_size: Optional[Sequence[int]] = None,
+        configuration: Optional[str] = None,
+        domain: Optional[str] = None,
+        overlap: float = 0.5,
+        image_reader: Optional[str] = None,
+        multi_image: Optional[bool] = None,
+        transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+    ):
+        manifest = load_preprocessed_dataset_manifest(str(preprocessed_folder))
+        config, task_mode, selected_domain = _manifest_config_and_task(manifest, domain)
+        resolved_patch_size = (
+            tuple(int(value) for value in patch_size)
+            if patch_size is not None
+            else _patch_size_from_manifest(manifest, configuration)
+        )
+        self.preprocessed_folder = str(preprocessed_folder)
+        self.manifest = manifest
+        self.configuration = configuration or manifest.get("default_configuration")
+        self.domain = selected_domain
+        input_metadata = (
+            manifest if selected_domain is None else manifest["domains"][selected_domain]
+        )
+        resolved_reader = image_reader if image_reader is not None else (input_metadata.get("image_reader") or "auto")
+        resolved_multi_image = (
+            bool(multi_image)
+            if multi_image is not None
+            else bool(input_metadata.get("multi_image", False))
+        )
+        super().__init__(
+            images_dir=images_dir,
+            config=config,
+            patch_size=resolved_patch_size,
+            overlap=overlap,
+            image_reader=resolved_reader,
+            multi_image=resolved_multi_image,
+            transform=transform,
+            task_mode=task_mode,
+        )

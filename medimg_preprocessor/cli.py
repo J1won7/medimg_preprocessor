@@ -999,6 +999,8 @@ def _preprocess_segmentation_or_self_supervised(
             val_ratio=args.val_ratio,
             split_seed=args.split_seed,
             storage_format=args.storage_format,
+            image_reader=args.image_reader,
+            multi_image=args.multi_image,
         )
 
     if args.run_stage in {RunStage.TRAIN, RunStage.PREDICT_AND_EVALUATE}:
@@ -1064,6 +1066,8 @@ def _preprocess_segmentation_or_self_supervised(
         val_ratio=args.val_ratio,
         split_seed=args.split_seed,
         storage_format=args.storage_format,
+        image_reader=args.image_reader,
+        multi_image=args.multi_image,
     )
 
 
@@ -1148,6 +1152,8 @@ def _preprocess_paired(
         val_ratio=args.val_ratio,
         split_seed=args.split_seed,
         storage_format=args.storage_format,
+        image_reader=args.source_reader,
+        multi_image=args.multi_image,
     )
 
 
@@ -1263,6 +1269,9 @@ def _preprocess_unpaired(
         val_ratio=args.val_ratio,
         split_seed=args.split_seed,
         storage_format=args.storage_format,
+        domain_a_reader=args.domain_a_reader,
+        domain_b_reader=args.domain_b_reader,
+        multi_image=args.multi_image,
     )
 
 

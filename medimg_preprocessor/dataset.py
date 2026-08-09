@@ -384,6 +384,8 @@ def save_preprocessed_dataset_manifest(
     val_ratio: float = 0.2,
     split_seed: int = 42,
     storage_format: str = DEFAULT_STORAGE_FORMAT,
+    image_reader: Optional[str] = None,
+    multi_image: bool = False,
 ) -> str:
     if not os.path.isdir(folder):
         _fail_validation(f"Preprocessed dataset folder does not exist: {folder}")
@@ -397,6 +399,8 @@ def save_preprocessed_dataset_manifest(
         "task_mode": task_mode,
         "run_stage": run_stage,
         "dataset_kind": "single_folder",
+        "image_reader": image_reader,
+        "multi_image": bool(multi_image),
         "storage_format": _validate_storage_format(storage_format),
         "default_patch_size": None if default_patch_size is None else [int(i) for i in default_patch_size],
         "default_configuration": default_configuration,
@@ -437,6 +441,10 @@ def save_preprocessed_dataset(
     identifiers_b: Optional[Sequence[str]] = None,
     random_pairing: bool = True,
     storage_format: str = DEFAULT_STORAGE_FORMAT,
+    image_reader: Optional[str] = None,
+    multi_image: bool = False,
+    domain_a_reader: Optional[str] = None,
+    domain_b_reader: Optional[str] = None,
 ) -> str:
     _validate_task_mode(task_mode)
     storage_format = _validate_storage_format(storage_format)
@@ -459,6 +467,9 @@ def save_preprocessed_dataset(
             split_seed=split_seed,
             random_pairing=random_pairing,
             storage_format=storage_format,
+            domain_a_reader=domain_a_reader,
+            domain_b_reader=domain_b_reader,
+            multi_image=multi_image,
         )
     if folder_a is not None or folder_b is not None:
         _fail_validation(f"{task_mode} save_preprocessed_dataset does not accept folder_a/folder_b")
@@ -478,6 +489,8 @@ def save_preprocessed_dataset(
         val_ratio=val_ratio,
         split_seed=split_seed,
         storage_format=storage_format,
+        image_reader=image_reader,
+        multi_image=multi_image,
     )
 
 
@@ -498,6 +511,9 @@ def save_unpaired_preprocessed_dataset_manifest(
     split_seed: int = 42,
     random_pairing: bool = True,
     storage_format: str = DEFAULT_STORAGE_FORMAT,
+    domain_a_reader: Optional[str] = None,
+    domain_b_reader: Optional[str] = None,
+    multi_image: bool = False,
 ) -> str:
     if not os.path.isdir(root_folder):
         _fail_validation(f"Preprocessed dataset root folder does not exist: {root_folder}")
@@ -525,6 +541,8 @@ def save_unpaired_preprocessed_dataset_manifest(
         "domains": {
             "a": {
                 "folder": os.path.relpath(folder_a_abs, root_folder),
+                "image_reader": domain_a_reader,
+                "multi_image": bool(multi_image),
                 "identifiers": manifest_identifiers_a,
                 "splits": _build_split_mapping(
                     manifest_identifiers_a,
@@ -538,6 +556,8 @@ def save_unpaired_preprocessed_dataset_manifest(
             },
             "b": {
                 "folder": os.path.relpath(folder_b_abs, root_folder),
+                "image_reader": domain_b_reader,
+                "multi_image": bool(multi_image),
                 "identifiers": manifest_identifiers_b,
                 "splits": _build_split_mapping(
                     manifest_identifiers_b,
@@ -586,6 +606,10 @@ def load_preprocessed_dataset_manifest(folder: str) -> dict:
         _fail_validation("Manifest 'default_patch_size' must be a list when provided")
     if manifest.get("default_configuration") is not None and not isinstance(manifest["default_configuration"], str):
         _fail_validation("Manifest 'default_configuration' must be a string when provided")
+    if manifest.get("image_reader") is not None and not isinstance(manifest["image_reader"], str):
+        _fail_validation("Manifest 'image_reader' must be a string when provided")
+    if "multi_image" in manifest and not isinstance(manifest["multi_image"], bool):
+        _fail_validation("Manifest 'multi_image' must be a bool when provided")
     if manifest.get("splits") is not None:
         if not isinstance(manifest["splits"], dict):
             _fail_validation("Manifest 'splits' must be a dict when provided")
@@ -618,6 +642,11 @@ def load_preprocessed_dataset_manifest(folder: str) -> dict:
                 _fail_validation(f"Unpaired manifest must contain a '{domain_key}' domain mapping")
             if not isinstance(domains[domain_key].get("folder"), str):
                 _fail_validation(f"Unpaired manifest domain '{domain_key}' must contain a string 'folder'")
+            reader = domains[domain_key].get("image_reader")
+            if reader is not None and not isinstance(reader, str):
+                _fail_validation(f"Unpaired manifest domain '{domain_key}' image_reader must be a string")
+            if "multi_image" in domains[domain_key] and not isinstance(domains[domain_key]["multi_image"], bool):
+                _fail_validation(f"Unpaired manifest domain '{domain_key}' multi_image must be a bool")
             identifiers = domains[domain_key].get("identifiers")
             if identifiers is not None and not isinstance(identifiers, list):
                 _fail_validation(
