@@ -142,6 +142,28 @@ def test_linear_label_and_mask_interpolation_preserve_discrete_values():
     assert result["mask"].dtype == torch.bool
 
 
+def test_3d_affine_uses_valid_grid_sample_theta_and_mode():
+    sample = _segmentation_sample()
+    augmentation = NNUNetV2Augmentation(
+        p_rotation=1,
+        p_scaling=1,
+        dummy_2d=False,
+        p_gaussian_noise=0,
+        p_gaussian_blur=0,
+        p_brightness=0,
+        p_contrast=0,
+        p_low_resolution=0,
+        p_gamma_invert=0,
+        p_gamma=0,
+        mirror_axes=(),
+    )
+
+    result = augmentation.apply(sample, rng=np.random.RandomState(29))
+
+    assert result["image"].shape == sample["image"].shape
+    assert result["target"].shape == sample["target"].shape
+
+
 def test_paired_fields_receive_the_same_spatial_transform():
     image = torch.zeros((1, 8, 12, 12), dtype=torch.float32)
     image[:, 2:6, 3:8, 3:8] = 1.0

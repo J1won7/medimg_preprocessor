@@ -489,8 +489,13 @@ class NNUNetV2Augmentation:
         else:
             output_shape = (1, channels, *tuple(int(i) for i in spatial_shape))
             axis_sizes = np.asarray(spatial_shape, dtype=np.float32)
-        affine = np.asarray(theta_array[:, :-1], dtype=np.float32)
-        normalized = np.diag(1.0 / axis_sizes).dot(affine).dot(np.diag(axis_sizes))
+        affine = np.asarray(theta_array, dtype=np.float32)
+        linear = affine[:, :-1]
+        normalized = np.empty_like(affine)
+        normalized[:, :-1] = np.diag(1.0 / axis_sizes).dot(linear).dot(np.diag(axis_sizes))
+        # affine_grid requires (spatial_dims, spatial_dims + 1). Keep the
+        # translation column rather than reducing theta to a square matrix.
+        normalized[:, -1] = affine[:, -1]
         theta = torch.as_tensor(normalized, dtype=torch.float32, device=device).unsqueeze(0)
         return F.affine_grid(theta, output_shape, align_corners=False)
 
@@ -504,7 +509,9 @@ class NNUNetV2Augmentation:
         mode: str,
     ) -> "torch.Tensor":
         if mode == "linear":
-            mode = "bilinear" if dummy_2d or len(spatial_shape) == 2 else "trilinear"
+            # grid_sample calls 5D trilinear interpolation "bilinear" too.
+            # "trilinear" is only a valid mode name for interpolate.
+            mode = "bilinear"
         if dummy_2d:
             channels = int(data.shape[1])
             depth = int(spatial_shape[0])
