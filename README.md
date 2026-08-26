@@ -66,8 +66,9 @@ dataset/
     └── case_0002.nii.gz
 ```
 
-확장자를 제외한 파일명이 case identifier입니다. image와 target은 동일한
-identifier를 가져야 합니다. 지원 확장자는 `.nii.gz`, `.nii`, `.nrrd`, `.mha`,
+확장자를 제외한 파일명이 case identifier입니다. image와 target을 함께 사용하는
+모드에서는 양쪽에 모두 존재하는 identifier만 처리하고, 한쪽에만 있는 case는
+로그를 남긴 뒤 자동으로 제외합니다. 지원 확장자는 `.nii.gz`, `.nii`, `.nrrd`, `.mha`,
 `.gipl`, `.tiff`, `.tif`, `.png`, `.bmp`입니다.
 
 여러 채널을 파일로 나누었다면 `--multi-image`를 사용합니다.

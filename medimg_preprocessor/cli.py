@@ -792,21 +792,23 @@ def _assert_matching_identifiers(
     right: dict[str, list[str]],
     left_label: str,
     right_label: str,
+    *,
+    log: bool = True,
 ) -> list[str]:
     left_ids = set(left.keys())
     right_ids = set(right.keys())
     missing_in_right = sorted(left_ids.difference(right_ids))
     missing_in_left = sorted(right_ids.difference(left_ids))
-    if missing_in_right or missing_in_left:
-        pieces = []
-        if missing_in_right:
-            pieces.append(f"missing in {right_label}: {missing_in_right}")
-        if missing_in_left:
-            pieces.append(f"missing in {left_label}: {missing_in_left}")
-        raise ValueError(
-            f"{left_label} and {right_label} must contain the same case identifiers; " + "; ".join(pieces)
+    if (missing_in_right or missing_in_left) and log:
+        matched_ids = sorted(left_ids.intersection(right_ids))
+        print(
+            f"  identifier matching[{left_label}/{right_label}]: using {len(matched_ids)} matched cases; "
+            f"ignored {len(missing_in_right)} {left_label} cases without matching {right_label}; "
+            f"ignored {len(missing_in_left)} {right_label} cases without matching {left_label}",
+            flush=True,
         )
-    return sorted(left_ids)
+        return matched_ids
+    return sorted(left_ids.intersection(right_ids))
 
 
 def _filter_optional_matching_identifiers(
@@ -1019,7 +1021,11 @@ def _preprocess_segmentation_or_self_supervised(
         if labels is None:
             raise ValueError("segmentation --target-mask-dir requires --target-dir")
         target_masks = _filter_optional_matching_identifiers(labels, target_masks, "labels", "target masks")
-    identifiers = sorted(images.keys()) if labels is None else _assert_matching_identifiers(images, labels, "images", "labels")
+    identifiers = (
+        sorted(images.keys())
+        if labels is None
+        else _assert_matching_identifiers(images, labels, "images", "labels", log=False)
+    )
     work_items = [
         {
             "identifier": identifier,
@@ -1099,7 +1105,7 @@ def _preprocess_paired(
     identifiers = (
         sorted(sources.keys())
         if targets is None
-        else _assert_matching_identifiers(sources, targets, "source", "target")
+        else _assert_matching_identifiers(sources, targets, "source", "target", log=False)
     )
     source_masks = _filter_optional_matching_identifiers(sources, source_masks, "source", "source masks")
     if target_masks is not None:
@@ -1408,7 +1414,12 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                 else None
             )
             if labels is not None:
-                _assert_matching_identifiers(images, labels, "images", "labels")
+                matched_ids = _assert_matching_identifiers(images, labels, "images", "labels")
+                if not matched_ids:
+                    print("  no matched image/label cases; preprocessing skipped", flush=True)
+                    return 0
+                images = {identifier: images[identifier] for identifier in matched_ids}
+                labels = {identifier: labels[identifier] for identifier in matched_ids}
             _log_stage(
                 2,
                 total_steps,
@@ -1474,7 +1485,12 @@ def _preprocess_dataset_command(args: argparse.Namespace) -> int:
                 else None
             )
             if targets is not None:
-                _assert_matching_identifiers(sources, targets, "source", "target")
+                matched_ids = _assert_matching_identifiers(sources, targets, "source", "target")
+                if not matched_ids:
+                    print("  no matched source/target cases; preprocessing skipped", flush=True)
+                    return 0
+                sources = {identifier: sources[identifier] for identifier in matched_ids}
+                targets = {identifier: targets[identifier] for identifier in matched_ids}
             _log_stage(
                 2,
                 total_steps,
