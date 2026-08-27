@@ -14,7 +14,8 @@ from .geometry import (
     ensure_binary_mask,
     postprocess_binary_mask,
     postprocess_label_instances,
-    resample_array,
+    resample_image,
+    resample_mask,
 )
 from .normalization import get_normalizer
 
@@ -347,54 +348,60 @@ class ModularPreprocessor:
                 target_spacing = [spacing[0]] + target_spacing
             new_shape = compute_new_shape(image.shape[1:], spacing, target_spacing)
             image_orders = self.config.resampling.orders_for("image", image.ndim - 1)
-            label_orders = self.config.resampling.orders_for("label", image.ndim - 1)
             mask_orders = self.config.resampling.orders_for("mask", image.ndim - 1)
-            image = resample_array(
+            image = resample_image(
                 image,
                 new_shape,
-                is_seg=False,
                 orders=image_orders,
+                current_spacing=spacing,
+                new_spacing=target_spacing,
             )
-            patch_sampling_image = resample_array(
+            patch_sampling_image = resample_image(
                 patch_sampling_image,
                 new_shape,
-                is_seg=False,
                 orders=image_orders,
+                current_spacing=spacing,
+                new_spacing=target_spacing,
             )
-            patch_sampling_mask = resample_array(
+            patch_sampling_mask = resample_mask(
                 patch_sampling_mask[None].astype(np.float32),
                 new_shape,
-                is_seg=True,
                 orders=mask_orders,
+                current_spacing=spacing,
+                new_spacing=target_spacing,
             )[0] > 0
             if target is not None:
                 if target_is_segmentation:
-                    target = resample_array(
+                    target = resample_mask(
                         target,
                         new_shape,
-                        is_seg=True,
-                        orders=label_orders,
+                        orders=mask_orders,
+                        current_spacing=spacing,
+                        new_spacing=target_spacing,
                     )
                     if patch_sampling_target is not None:
-                        patch_sampling_target = resample_array(
+                        patch_sampling_target = resample_mask(
                             patch_sampling_target,
                             new_shape,
-                            is_seg=True,
-                            orders=label_orders,
+                            orders=mask_orders,
+                            current_spacing=spacing,
+                            new_spacing=target_spacing,
                         )
                 else:
-                    target = resample_array(
+                    target = resample_image(
                         target,
                         new_shape,
-                        is_seg=False,
                         orders=image_orders,
+                        current_spacing=spacing,
+                        new_spacing=target_spacing,
                     )
                     if patch_sampling_target is not None:
-                        patch_sampling_target = resample_array(
+                        patch_sampling_target = resample_image(
                             patch_sampling_target,
                             new_shape,
-                            is_seg=False,
                             orders=image_orders,
+                            current_spacing=spacing,
+                            new_spacing=target_spacing,
                         )
             properties["spacing_after_resampling"] = target_spacing
             properties["shape_after_resampling"] = tuple(int(i) for i in new_shape)
@@ -622,35 +629,40 @@ class TaskAwarePreprocessor:
             new_shape = compute_new_shape(image.shape[1:], spacing, target_spacing)
             image_orders = self.config.resampling.orders_for("image", image.ndim - 1)
             mask_orders = self.config.resampling.orders_for("mask", image.ndim - 1)
-            image = resample_array(
+            image = resample_image(
                 image,
                 new_shape,
-                is_seg=False,
                 orders=image_orders,
+                current_spacing=spacing,
+                new_spacing=target_spacing,
             )
-            patch_sampling_image = resample_array(
+            patch_sampling_image = resample_image(
                 patch_sampling_image,
                 new_shape,
-                is_seg=False,
                 orders=image_orders,
+                current_spacing=spacing,
+                new_spacing=target_spacing,
             )
-            reference = resample_array(
+            reference = resample_image(
                 reference,
                 new_shape,
-                is_seg=False,
                 orders=image_orders,
+                current_spacing=spacing,
+                new_spacing=target_spacing,
             )
-            patch_sampling_reference = resample_array(
+            patch_sampling_reference = resample_image(
                 patch_sampling_reference,
                 new_shape,
-                is_seg=False,
                 orders=image_orders,
+                current_spacing=spacing,
+                new_spacing=target_spacing,
             )
-            patch_sampling_mask = resample_array(
+            patch_sampling_mask = resample_mask(
                 patch_sampling_mask[None].astype(np.float32),
                 new_shape,
-                is_seg=True,
                 orders=mask_orders,
+                current_spacing=spacing,
+                new_spacing=target_spacing,
             )[0] > 0
             properties["spacing_after_resampling"] = target_spacing
             properties["shape_after_resampling"] = tuple(int(i) for i in new_shape)

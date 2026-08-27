@@ -565,6 +565,7 @@ def plan_preprocessing_from_cases(
     *,
     dataset_json: Optional[dict] = None,
     reference_cases: Optional[Dict[str, Union[Sequence[str], str]]] = None,
+    reference_is_segmentation: bool = False,
     suppress_transpose: bool = False,
     overwrite_target_spacing: Optional[Sequence[float]] = None,
     ct_clip_min: Optional[float] = None,
@@ -605,8 +606,7 @@ def plan_preprocessing_from_cases(
         },
         resampling=ResamplingConfig(
             image_order=3,
-            label_order=1,
-            mask_order=0,
+            mask_order=1 if reference_is_segmentation else 0,
         ),
     )
     fingerprint["planning_configurations"] = {

@@ -7,7 +7,7 @@ instance segmentation, paired/unpaired generative, self-supervised 작업을 지
 ## 주요 기능
 
 - 데이터셋 자동 스캔과 case 매칭
-- voxel spacing 변경과 영상/label/mask 보간
+- voxel spacing 변경과 image/discrete mask 보간
 - CT/MRI에 사용할 normalization 설정
 - 외부 mask 또는 threshold 기반 patch sampling
 - semantic/instance label 후처리
@@ -143,44 +143,75 @@ paired/unpaired 모드에서는 `--source-reader`, `--target-reader`,
 
 ## 보간과 spacing
 
-지원 보간 방식과 숫자 order는 다음과 같습니다.
+`--spacing`은 전처리 결과의 목표 voxel spacing입니다. 예를 들어 원본이
+`1.5 x 3.0 x 1.5`이고 목표가 `1.0 x 1.0 x 1.0`이면 세 축 모두에 대해 새 격자를
+계산하고 보간합니다. 특정 축만 임의로 복제하는 방식이 아닙니다.
 
-| 방식 | order | 용도 |
+보간은 직접 구현한 resize가 아니라 SimpleITK의 물리공간 resampling을 사용합니다.
+역순 NIfTI 축과 채널 축을 내부에서 변환한 뒤 결과를 원래 `(C, X, Y[, Z])` 순서로
+복원합니다.
+
+### Image 보간
+
+`image`는 연속 intensity 데이터로 처리합니다. 기본값은 `cubic`이며 다음 값 중에서
+선택할 수 있습니다.
+
+| 옵션 | order | 기능 |
 | --- | ---: | --- |
-| `nearest` | 0 | 값을 보존해야 하는 label/mask |
-| `linear` | 1 | 선형 보간 |
-| `quadratic` | 2 | 2차 보간 |
-| `cubic` | 3 | 영상 기본값 |
-| `quartic` | 4 | 4차 보간 |
-| `quintic` | 5 | 5차 보간 |
+| `--image-interpolation nearest` | 0 | 최근접 이웃 |
+| `--image-interpolation linear` | 1 | 선형 보간 |
+| `--image-interpolation quadratic` | 2 | 2차 B-spline |
+| `--image-interpolation cubic` | 3 | 3차 B-spline, 기본값 |
+| `--image-interpolation quartic` | 4 | 4차 B-spline |
+| `--image-interpolation quintic` | 5 | 5차 B-spline |
 
-자동 planning 기준 기본값은 image `cubic`, label `linear`, sampling mask `nearest`입니다.
-Instance ID를 정확히 보존해야 하면 label은 `nearest`를 권장합니다.
-
-전체 spatial axis에 같은 방식을 적용:
+모든 축에 같은 방식을 적용합니다.
 
 ```bash
---image-interpolation cubic \
---label-interpolation nearest \
---mask-interpolation nearest
+--image-interpolation cubic
 ```
 
-축마다 다르게 적용:
+축별 방식을 지정하려면 transpose 이후 spatial axis 순서로 입력합니다. 3D이면 세
+개의 값이 필요합니다.
 
 ```bash
---image-interpolation-axes cubic linear cubic \
---label-interpolation-axes nearest nearest nearest \
---mask-interpolation-axes nearest nearest nearest
+--image-interpolation-axes cubic linear cubic
 ```
 
-축별 옵션의 입력 순서는 transpose 이후 spatial axis 순서이며, 3D 데이터에는 세
-개의 값을 입력해야 합니다. `--label-order 0`과 `--label-order 1`은 호환성을 위한
-숫자 alias입니다.
+축별 방식은 SimpleITK가 한 번의 연산에 하나의 interpolator만 받기 때문에 지정된
+축 순서대로 순차 적용합니다. 모든 축에 같은 방식을 쓰면 하나의 3D resampling으로
+처리되어 더 효율적입니다.
 
-- `--label-order 0`: nearest-neighbor 방식
-- `--label-order 1`: 각 label ID를 독립적으로 선형 보간 후 label map으로 복원
+### Mask와 label 보간
 
-`--label-order`와 `--label-interpolation`은 동시에 사용할 수 없습니다.
+binary mask와 semantic/instance label은 모두 discrete mask 데이터로 취급하므로
+하나의 `mask` 정책을 공유합니다. 따라서 외부 kidney mask와 target instance label에
+서로 다른 discrete 보간 정책을 적용하지 않습니다.
+
+| 옵션 | order | 기능 |
+| --- | ---: | --- |
+| `--mask-interpolation nearest` | 0 | 최근접 이웃, 원래 ID와 경계 보존에 가장 안전 |
+| `--mask-interpolation linear` | 1 | SimpleITK label-aware 선형 보간, fractional ID를 만들지 않음 |
+| `--mask-order 0` / `--mask-order 1` | 0 / 1 | 위 방식의 숫자 alias |
+
+```bash
+--mask-interpolation linear
+```
+
+축별 mask 정책도 지정할 수 있습니다.
+
+```bash
+--mask-interpolation-axes linear linear linear
+```
+
+`--label-interpolation`, `--label-interpolation-axes`, `--label-order`는 이전 버전
+호출을 위한 호환 alias이며 내부적으로 `mask` 설정으로 변환됩니다. mask에는
+`quadratic` 이상을 허용하지 않습니다. instance ID의 topology를 반드시 보존해야
+하면 `nearest`를 사용하십시오.
+
+Python 3.7에서 사용하는 SimpleITK 2.1.1에는 `sitkLabelLinear`가 없으므로
+`--mask-interpolation linear`가 사용 가능한 label-aware `sitkLabelGaussian`으로
+자동 대체됩니다. 실행 중 한 번 경고가 출력됩니다.
 
 ## Normalization
 
@@ -292,7 +323,7 @@ python -m medimg_preprocessor preprocess-dataset \
   --target-dir data/labelsTr \
   --output-folder data/preprocessed_seg \
   --spacing 1.0 1.0 1.0 \
-  --label-interpolation nearest
+  --mask-interpolation nearest
 ```
 
 ### Instance segmentation
@@ -307,10 +338,11 @@ python -m medimg_preprocessor preprocess-dataset \
   --target-dir data/instance_labelsTr \
   --output-folder data/preprocessed_instance \
   --spacing 1.0 1.0 1.0 \
-  --label-interpolation nearest \
   --mask-interpolation nearest \
   --save-mask
 ```
+
+여기서 `nearest`는 외부 kidney mask와 instance label 모두에 적용됩니다.
 
 ## PyTorch Dataset
 
@@ -442,8 +474,9 @@ image와 동일한 공간 변환이 적용되지만, 보간 방식은 별도로 
 | `initial_scale_range` | `(0.85, 1.25)` | initial patch 크기 계산에 사용하는 scale 범위 |
 | `paired_intensity` | `synchronized` | paired source/target intensity 변환 방식. `none`이면 paired intensity 변환을 끔 |
 
-`linear` label 보간은 각 ID를 독립적인 binary mask로 보간하고 threshold 후 다시
-label map으로 복원합니다. 객체 ID 보존이 가장 중요하면 `nearest`를 사용하십시오.
+Dataset augmentation의 `linear` label 보간은 각 ID를 독립적인 binary mask로
+보간하고 threshold 후 다시 label map으로 복원합니다. 객체 ID 보존이 가장
+중요하면 `nearest`를 사용하십시오.
 `initial_scale_range`는 실제 scaling 범위를 바꾸지 않고 initial patch 크기 계산에만
 사용됩니다.
 
@@ -504,10 +537,11 @@ storage format이 기록됩니다.
 | --- | --- |
 | `image_order` | 모든 축에 적용할 image order |
 | `image_orders` | 축별 image order |
-| `label_order` | 모든 축에 적용할 label order |
-| `label_orders` | 축별 label order |
-| `mask_order` | 모든 축에 적용할 mask order |
-| `mask_orders` | 축별 mask order |
+| `mask_order` | 모든 축에 적용할 mask/label order |
+| `mask_orders` | 축별 mask/label order |
+
+이전 버전 manifest의 `label_order`와 `label_orders`도 읽을 수 있지만, 새 manifest에는
+`mask` 항목만 기록됩니다.
 
 저장된 manifest를 확인하거나 다시 생성할 수 있습니다.
 
@@ -584,9 +618,10 @@ for case_index, accumulator in enumerate(accumulators):
     )
 ```
 
-`segmentation` manifest는 `save_prediction_nifti`에서 label용 resampling을 자동 적용하며
-normalization을 역변환하지 않습니다. 모델 출력이 class logits이면 먼저 `argmax`로 label map을
-만드십시오. generative task는 image resampling과 normalization 역변환을 적용합니다.
+`segmentation` manifest는 `save_prediction_nifti`에서 discrete mask/label용 resampling을
+자동 적용하며 normalization을 역변환하지 않습니다. 모델 출력이 class logits이면 먼저
+`argmax`로 label map을 만드십시오. generative task는 image resampling과 normalization
+역변환을 적용합니다.
 
 unpaired manifest는 입력 domain을 반드시 지정해야 합니다.
 

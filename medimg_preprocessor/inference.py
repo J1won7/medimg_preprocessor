@@ -19,7 +19,7 @@ except ModuleNotFoundError:
 
 from .config import PreprocessingConfig, ResamplingConfig
 from .dataset import load_preprocessed_dataset_manifest
-from .geometry import resample_array
+from .geometry import resample_image, resample_mask
 from .imageio import (
     NaturalImage2DIO,
     NibabelIO,
@@ -151,14 +151,7 @@ def _config_from_manifest_payload(payload: Any) -> PreprocessingConfig:
     if not isinstance(resampling_payload, dict):
         _fail_validation("Manifest preprocessing_config.resampling must be a mapping")
     try:
-        resampling = ResamplingConfig(
-            image_order=resampling_payload.get("image_order", 3),
-            image_orders=resampling_payload.get("image_orders"),
-            label_order=resampling_payload.get("label_order", 0),
-            label_orders=resampling_payload.get("label_orders"),
-            mask_order=resampling_payload.get("mask_order", 0),
-            mask_orders=resampling_payload.get("mask_orders"),
-        )
+        resampling = ResamplingConfig.from_mapping(resampling_payload)
         return PreprocessingConfig(
             spacing=payload["spacing"],
             transpose_forward=payload["transpose_forward"],
@@ -317,11 +310,21 @@ def _undo_preprocessing(
     if settings.get("resample", True):
         shape_before_resampling = tuple(int(i) for i in properties["shape_before_resampling"])
         orders = config.resampling.orders_for(resampling_role, restored.ndim - 1)
-        restored = resample_array(
+        current_spacing = properties.get(
+            "spacing_after_resampling",
+            config.spacing,
+        )
+        new_spacing = properties.get(
+            "spacing_after_transpose",
+            config.spacing,
+        )
+        resample = resample_mask if is_segmentation else resample_image
+        restored = resample(
             restored,
             shape_before_resampling,
-            is_seg=is_segmentation,
             orders=orders,
+            current_spacing=current_spacing,
+            new_spacing=new_spacing,
         )
 
     if settings.get("transpose", True):

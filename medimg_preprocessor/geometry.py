@@ -11,7 +11,11 @@ from scipy.ndimage import (
     generate_binary_structure,
     label,
 )
-from skimage.transform import resize
+
+try:
+    import SimpleITK as sitk
+except (ImportError, OSError):  # pragma: no cover - exercised by installation failures
+    sitk = None
 
 
 MAX_INTERPOLATION_ORDER = 5
@@ -222,110 +226,366 @@ def compute_new_shape(
     return np.array([int(round(i / j * k)) for i, j, k in zip(old_spacing, new_spacing, old_shape)])
 
 
-def _resize_segmentation(segmentation: np.ndarray, new_shape: Sequence[int], order: int = 1) -> np.ndarray:
-    if order == 0:
-        return resize(
-            segmentation,
-            new_shape,
-            order=0,
-            mode="edge",
-            anti_aliasing=False,
-            preserve_range=True,
-        ).astype(segmentation.dtype, copy=False)
+_MASK_LINEAR_FALLBACK_WARNED = False
 
-    result = np.zeros(new_shape, dtype=segmentation.dtype)
-    for label in np.unique(segmentation):
-        resized_mask = resize(
-            (segmentation == label).astype(float),
-            new_shape,
-            order=order,
-            mode="edge",
-            anti_aliasing=False,
-            preserve_range=True,
+
+def _require_simpleitk() -> None:
+    if sitk is None:
+        _fail_validation(
+            "SimpleITK is required for image and mask resampling; install the package dependencies first"
         )
-        result[resized_mask >= 0.5] = label
+
+
+def _identity_direction(spatial_dims: int) -> tuple:
+    return tuple(float(value) for value in np.eye(spatial_dims, dtype=np.float64).ravel())
+
+
+def _normalize_spacing(
+    spacing: Optional[Sequence[float]],
+    spatial_dims: int,
+    name: str,
+) -> tuple:
+    if spacing is None:
+        return (1.0,) * spatial_dims
+    if len(spacing) != spatial_dims:
+        _fail_validation(f"{name} must contain {spatial_dims} values")
+    values = tuple(float(value) for value in spacing)
+    if any(not np.isfinite(value) or value <= 0 for value in values):
+        _fail_validation(f"{name} must contain finite positive values")
+    return values
+
+
+def _normalize_orders(
+    data: np.ndarray,
+    orders: Optional[Sequence[int]],
+    order: Optional[int],
+) -> tuple:
+    spatial_dims = data.ndim - 1
+    if orders is not None and order is not None:
+        _fail_validation("provide either orders or order, not both")
+    if orders is None:
+        if order is None:
+            _fail_validation("an interpolation order is required")
+        orders = (int(order),) * spatial_dims
+    if len(orders) != spatial_dims:
+        _fail_validation(
+            f"orders must contain {spatial_dims} values for data with {spatial_dims} spatial dimensions"
+        )
+    normalized = tuple(int(value) for value in orders)
+    if any(value < 0 or value > MAX_INTERPOLATION_ORDER for value in normalized):
+        _fail_validation(
+            f"resampling orders must be between 0 and {MAX_INTERPOLATION_ORDER}"
+        )
+    return normalized
+
+
+def _validate_resampling_inputs(
+    data: np.ndarray,
+    new_shape: Sequence[int],
+    current_spacing: Optional[Sequence[float]],
+    new_spacing: Optional[Sequence[float]],
+    orders: Optional[Sequence[int]],
+    order: Optional[int],
+) -> tuple:
+    if data.ndim not in (3, 4):
+        _fail_validation(
+            f"resampling expects channel-first 2D/3D data (C, X, Y[, Z]), got shape {data.shape}"
+        )
+    spatial_dims = data.ndim - 1
+    target_shape = tuple(int(value) for value in new_shape)
+    if len(target_shape) != spatial_dims or any(value <= 0 for value in target_shape):
+        _fail_validation(f"new_shape must contain {spatial_dims} positive values")
+    if not np.all(np.isfinite(data)):
+        _fail_validation("resampling input contains non-finite values")
+
+    source_spacing = _normalize_spacing(current_spacing, spatial_dims, "current_spacing")
+    if new_spacing is None:
+        target_spacing = tuple(
+            source_spacing[axis] * float(data.shape[axis + 1]) / float(target_shape[axis])
+            for axis in range(spatial_dims)
+        )
+    else:
+        target_spacing = _normalize_spacing(new_spacing, spatial_dims, "new_spacing")
+    normalized_orders = _normalize_orders(data, orders, order)
+    return target_shape, source_spacing, target_spacing, normalized_orders
+
+
+def _simpleitk_interpolator(role: str, order: int):
+    _require_simpleitk()
+    if role == "mask":
+        if order == 0:
+            return sitk.sitkNearestNeighbor
+        if order != 1:
+            _fail_validation("mask interpolation supports only nearest (0) or label-linear (1)")
+
+        label_linear = getattr(sitk, "sitkLabelLinear", None)
+        if label_linear is not None:
+            return label_linear
+
+        # SimpleITK 2.1.1, required for Python 3.7, predates sitkLabelLinear.
+        # LabelGaussian is label-aware and preserves the original label set.
+        label_gaussian = getattr(sitk, "sitkLabelGaussian", None)
+        if label_gaussian is not None:
+            global _MASK_LINEAR_FALLBACK_WARNED
+            if not _MASK_LINEAR_FALLBACK_WARNED:
+                warnings.warn(
+                    "sitkLabelLinear is unavailable; mask order 1 uses "
+                    "sitkLabelGaussian for compatibility with this SimpleITK version",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                _MASK_LINEAR_FALLBACK_WARNED = True
+            return label_gaussian
+        _fail_validation(
+            "mask order 1 requires sitkLabelLinear or sitkLabelGaussian; use mask order 0 "
+            "with this SimpleITK installation"
+        )
+
+    if role != "image":
+        _fail_validation(f"unsupported resampling role: {role}")
+    if order == 0:
+        return sitk.sitkNearestNeighbor
+    if order == 1:
+        return sitk.sitkLinear
+    interpolator = getattr(sitk, "sitkBSpline" + str(order), None)
+    if interpolator is None:
+        _fail_validation(f"SimpleITK does not provide a B-spline order {order} interpolator")
+    return interpolator
+
+
+def _array_to_sitk_image(array: np.ndarray, spacing: Sequence[float]):
+    spatial_dims = array.ndim
+    image = sitk.GetImageFromArray(
+        np.transpose(array, tuple(range(spatial_dims - 1, -1, -1)))
+    )
+    image.SetSpacing(tuple(float(value) for value in spacing))
+    image.SetOrigin((0.0,) * spatial_dims)
+    image.SetDirection(_identity_direction(spatial_dims))
+    return image
+
+
+def _array_to_sitk_vector_image(array: np.ndarray, spacing: Sequence[float]):
+    spatial_dims = array.ndim - 1
+    channel_last = np.moveaxis(array, 0, -1)
+    itk_array = np.transpose(
+        channel_last,
+        tuple(range(spatial_dims - 1, -1, -1)) + (spatial_dims,),
+    )
+    image = sitk.GetImageFromArray(itk_array, isVector=True)
+    image.SetSpacing(tuple(float(value) for value in spacing))
+    image.SetOrigin((0.0,) * spatial_dims)
+    image.SetDirection(_identity_direction(spatial_dims))
+    return image
+
+
+def _resample_sitk_image(
+    image,
+    new_shape: Sequence[int],
+    new_spacing: Sequence[float],
+    interpolator,
+    use_nearest_extrapolator: bool,
+):
+    spatial_dims = len(new_shape)
+    resampler = sitk.ResampleImageFilter()
+    # The input array is reversed before GetImageFromArray, so ITK's x/y/z
+    # image size is already expressed in the package's spatial-axis order.
+    resampler.SetSize(tuple(int(value) for value in new_shape))
+    resampler.SetOutputSpacing(tuple(float(value) for value in new_spacing))
+    resampler.SetOutputOrigin((0.0,) * spatial_dims)
+    resampler.SetOutputDirection(_identity_direction(spatial_dims))
+    resampler.SetDefaultPixelValue(0.0)
+    resampler.SetInterpolator(interpolator)
+    if use_nearest_extrapolator and hasattr(resampler, "SetUseNearestNeighborExtrapolator"):
+        resampler.SetUseNearestNeighborExtrapolator(True)
+    return resampler.Execute(image)
+
+
+def _sitk_image_to_array(image) -> np.ndarray:
+    array = np.asarray(sitk.GetArrayFromImage(image))
+    return np.transpose(array, tuple(range(array.ndim - 1, -1, -1)))
+
+
+def _sitk_vector_image_to_array(image, spatial_dims: int) -> np.ndarray:
+    array = np.asarray(sitk.GetArrayFromImage(image))
+    array = np.transpose(array, tuple(range(spatial_dims - 1, -1, -1)) + (spatial_dims,))
+    return np.moveaxis(array, -1, 0)
+
+
+def _coerce_label_input(data: np.ndarray) -> np.ndarray:
+    rounded = np.rint(data)
+    if not np.array_equal(data, rounded):
+        _fail_validation("mask/label resampling input must contain integer label values")
+    info = np.iinfo(np.int32)
+    if np.any(rounded < info.min) or np.any(rounded > info.max):
+        _fail_validation("mask/label values must fit in a signed 32-bit integer")
+    return rounded.astype(np.int32, copy=False)
+
+
+def _resample_once(
+    data: np.ndarray,
+    new_shape: Sequence[int],
+    current_spacing: Sequence[float],
+    new_spacing: Sequence[float],
+    role: str,
+    order: int,
+) -> np.ndarray:
+    interpolator = _simpleitk_interpolator(role, order)
+    if role == "image":
+        working = data.astype(np.float32, copy=False)
+        if working.shape[0] == 1:
+            image = _array_to_sitk_image(working[0], current_spacing)
+            output = _resample_sitk_image(
+                image,
+                new_shape,
+                new_spacing,
+                interpolator,
+                use_nearest_extrapolator=True,
+            )
+            return _sitk_image_to_array(output)[None]
+        image = _array_to_sitk_vector_image(working, current_spacing)
+        output = _resample_sitk_image(
+            image,
+            new_shape,
+            new_spacing,
+            interpolator,
+            use_nearest_extrapolator=True,
+        )
+        return _sitk_vector_image_to_array(output, data.ndim - 1)
+
+    working = _coerce_label_input(data)
+    result = np.empty((working.shape[0],) + tuple(new_shape), dtype=np.int32)
+    for channel in range(working.shape[0]):
+        image = _array_to_sitk_image(working[channel], current_spacing)
+        output = _resample_sitk_image(
+            image,
+            new_shape,
+            new_spacing,
+            interpolator,
+            use_nearest_extrapolator=True,
+        )
+        result[channel] = _sitk_image_to_array(output)
     return result
 
 
-def _resize_data_or_seg(
+def _resample_role(
     data: np.ndarray,
     new_shape: Sequence[int],
-    *,
-    is_seg: bool,
-    order: int,
+    current_spacing: Sequence[float],
+    new_spacing: Sequence[float],
+    orders: Sequence[int],
+    role: str,
 ) -> np.ndarray:
-    if is_seg:
-        return _resize_segmentation(data, new_shape, order=order)
-    return resize(
+    if role == "mask" and any(order not in (0, 1) for order in orders):
+        _fail_validation("mask interpolation supports only nearest (0) or label-linear (1)")
+
+    target_shape = tuple(int(value) for value in new_shape)
+    if tuple(data.shape[1:]) == target_shape and np.allclose(current_spacing, new_spacing):
+        return data.copy()
+
+    if all(order == orders[0] for order in orders):
+        return _resample_once(
+            data,
+            target_shape,
+            current_spacing,
+            new_spacing,
+            role,
+            orders[0],
+        ).astype(data.dtype, copy=False)
+
+    # SimpleITK applies one interpolator per operation. Explicit per-axis
+    # policies therefore use sequential physical-space resampling. The common
+    # same-order path above remains a single operation.
+    result = data
+    intermediate_shape = list(data.shape[1:])
+    intermediate_spacing = list(current_spacing)
+    for axis, axis_order in enumerate(orders):
+        if (
+            intermediate_shape[axis] == target_shape[axis]
+            and np.isclose(intermediate_spacing[axis], new_spacing[axis])
+        ):
+            continue
+        step_source_spacing = tuple(intermediate_spacing)
+        intermediate_shape[axis] = target_shape[axis]
+        intermediate_spacing[axis] = new_spacing[axis]
+        result = _resample_once(
+            result,
+            tuple(intermediate_shape),
+            step_source_spacing,
+            tuple(intermediate_spacing),
+            role,
+            axis_order,
+        ).astype(data.dtype, copy=False)
+    return result
+
+
+def _resample_public(
+    data: np.ndarray,
+    new_shape: Sequence[int],
+    role: str,
+    current_spacing: Optional[Sequence[float]],
+    new_spacing: Optional[Sequence[float]],
+    orders: Optional[Sequence[int]],
+    order: Optional[int],
+) -> np.ndarray:
+    data = np.asarray(data)
+    target_shape, source_spacing, target_spacing, normalized_orders = _validate_resampling_inputs(
         data,
         new_shape,
-        order=order,
-        mode="edge",
-        anti_aliasing=False,
-        preserve_range=True,
+        current_spacing,
+        new_spacing,
+        orders,
+        order,
+    )
+    return _resample_role(
+        data,
+        target_shape,
+        source_spacing,
+        target_spacing,
+        normalized_orders,
+        role,
     )
 
 
-def _resample_data_or_seg(
+def resample_image(
     data: np.ndarray,
     new_shape: Sequence[int],
-    *,
-    is_seg: bool,
-    orders: Sequence[int],
-    dtype_out=None,
+    current_spacing: Optional[Sequence[float]] = None,
+    new_spacing: Optional[Sequence[float]] = None,
+    orders: Optional[Sequence[int]] = None,
+    order: Optional[int] = None,
 ) -> np.ndarray:
-    if data.ndim not in (3, 4):
-        _fail_validation(f"data must be (C, X, Y) or (C, X, Y, Z), got {data.shape}")
-    if len(new_shape) != data.ndim - 1:
-        _fail_validation(f"new_shape must match spatial dims, got {new_shape} for data shape {data.shape}")
+    """Resample channel-first continuous image data with SimpleITK."""
 
-    new_shape = tuple(int(i) for i in new_shape)
-    orders = tuple(int(i) for i in orders)
-    if len(orders) != len(new_shape):
-        _fail_validation(
-            f"orders must contain {len(new_shape)} values for the spatial dimensions, got {len(orders)}"
-        )
-    if any(order < 0 or order > MAX_INTERPOLATION_ORDER for order in orders):
-        _fail_validation(
-            f"orders must be between 0 and {MAX_INTERPOLATION_ORDER}, got {orders}"
-        )
+    return _resample_public(
+        data,
+        new_shape,
+        "image",
+        current_spacing,
+        new_spacing,
+        orders,
+        order,
+    )
 
-    shape = tuple(int(i) for i in data.shape[1:])
-    if dtype_out is None:
-        dtype_out = data.dtype
-    reshaped_final = np.zeros((data.shape[0], *new_shape), dtype=dtype_out)
-    if shape == new_shape:
-        return data
 
-    data = data.astype(float, copy=False)
-    if len(set(orders)) == 1:
-        for c in range(data.shape[0]):
-            reshaped_final[c] = _resize_data_or_seg(
-                data[c],
-                new_shape,
-                is_seg=is_seg,
-                order=orders[0],
-            )
-        return reshaped_final
+def resample_mask(
+    data: np.ndarray,
+    new_shape: Sequence[int],
+    current_spacing: Optional[Sequence[float]] = None,
+    new_spacing: Optional[Sequence[float]] = None,
+    orders: Optional[Sequence[int]] = None,
+    order: Optional[int] = None,
+) -> np.ndarray:
+    """Resample channel-first masks/labels with SimpleITK label interpolators."""
 
-    # Different orders are applied one spatial axis at a time. This keeps the
-    # interpolation policy explicit for every axis instead of treating one
-    # axis as a special "z" dimension.
-    for c in range(data.shape[0]):
-        resampled = data[c]
-        for axis, order in enumerate(orders):
-            if resampled.shape[axis] == new_shape[axis]:
-                continue
-            axis_shape = list(resampled.shape)
-            axis_shape[axis] = new_shape[axis]
-            resampled = _resize_data_or_seg(
-                resampled,
-                tuple(axis_shape),
-                is_seg=is_seg,
-                order=order,
-            )
-        reshaped_final[c] = resampled
-    return reshaped_final
+    return _resample_public(
+        data,
+        new_shape,
+        "mask",
+        current_spacing,
+        new_spacing,
+        orders,
+        order,
+    )
 
 
 def resample_array(
@@ -335,22 +595,17 @@ def resample_array(
     is_seg: bool,
     orders: Optional[Sequence[int]] = None,
     order: Optional[int] = None,
+    current_spacing: Optional[Sequence[float]] = None,
+    new_spacing: Optional[Sequence[float]] = None,
 ) -> np.ndarray:
-    if len(new_shape) != data.ndim - 1:
-        _fail_validation(
-            f"new_shape must match data spatial dims, got {len(new_shape)} and data shape {data.shape}"
-        )
-    if any(i <= 0 for i in new_shape):
-        _fail_validation(f"new_shape must contain only positive values, got {tuple(new_shape)}")
-    if orders is not None and order is not None:
-        _fail_validation("Provide either orders or order, not both")
-    if orders is None:
-        if order is None:
-            _fail_validation("orders must be provided")
-        orders = tuple(int(order) for _ in range(len(new_shape)))
-    return _resample_data_or_seg(
+    """Backward-compatible dispatcher for image and mask resampling."""
+
+    function = resample_mask if is_seg else resample_image
+    return function(
         data,
         new_shape,
-        is_seg=is_seg,
+        current_spacing=current_spacing,
+        new_spacing=new_spacing,
         orders=orders,
+        order=order,
     )

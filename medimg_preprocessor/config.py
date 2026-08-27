@@ -15,23 +15,24 @@ MAX_INTERPOLATION_ORDER = 5
 class ResamplingConfig:
     image_order: int = 3
     image_orders: Optional[Tuple[int, ...]] = None
-    label_order: int = 0
-    label_orders: Optional[Tuple[int, ...]] = None
     mask_order: int = 0
     mask_orders: Optional[Tuple[int, ...]] = None
 
     def __post_init__(self) -> None:
         self.image_order = _validate_interpolation_order("image_order", self.image_order)
-        self.label_order = _validate_interpolation_order("label_order", self.label_order)
-        self.mask_order = _validate_interpolation_order("mask_order", self.mask_order)
+        self.mask_order = _validate_mask_interpolation_order("mask_order", self.mask_order)
         self.image_orders = _normalize_interpolation_orders("image_orders", self.image_orders)
-        self.label_orders = _normalize_interpolation_orders("label_orders", self.label_orders)
-        self.mask_orders = _normalize_interpolation_orders("mask_orders", self.mask_orders)
+        self.mask_orders = _normalize_mask_interpolation_orders(self.mask_orders)
 
     def orders_for(self, role: str, spatial_dims: int) -> Tuple[int, ...]:
         if spatial_dims <= 0:
             _fail_validation(f"spatial_dims must be positive, got {spatial_dims}")
-        if role not in {"image", "label", "mask"}:
+        # ``label`` is retained as a read-only compatibility alias. Both
+        # segmentation labels and binary masks are discrete mask data and must
+        # use one interpolation policy.
+        if role == "label":
+            role = "mask"
+        if role not in {"image", "mask"}:
             _fail_validation(f"Unknown resampling role '{role}'")
         default_order = int(getattr(self, f"{role}_order"))
         axis_orders = getattr(self, f"{role}_orders")
@@ -42,6 +43,48 @@ class ResamplingConfig:
                 f"{role}_orders must contain {spatial_dims} values for this data, got {len(axis_orders)}"
             )
         return tuple(axis_orders)
+
+    @classmethod
+    def from_mapping(cls, payload: Dict) -> "ResamplingConfig":
+        """Build a config and migrate the pre-unification label fields."""
+
+        if not isinstance(payload, dict):
+            _fail_validation("resampling configuration must be a mapping")
+
+        legacy_label_order = payload.get("label_order")
+        mask_order = payload.get("mask_order")
+        if mask_order is None or (
+            int(mask_order) == 0 and legacy_label_order not in (None, 0)
+        ):
+            mask_order = 0 if legacy_label_order is None else legacy_label_order
+
+        legacy_label_orders = payload.get("label_orders")
+        mask_orders = payload.get("mask_orders")
+        if mask_orders is None or (
+            legacy_label_orders is not None
+            and all(int(value) == 0 for value in mask_orders)
+            and any(int(value) != 0 for value in legacy_label_orders)
+        ):
+            mask_orders = legacy_label_orders
+
+        return cls(
+            image_order=payload.get("image_order", 3),
+            image_orders=payload.get("image_orders"),
+            mask_order=mask_order,
+            mask_orders=mask_orders,
+        )
+
+    @property
+    def label_order(self) -> int:
+        """Backward-compatible alias for the unified mask interpolation order."""
+
+        return self.mask_order
+
+    @property
+    def label_orders(self) -> Optional[Tuple[int, ...]]:
+        """Backward-compatible alias for the unified mask axis orders."""
+
+        return self.mask_orders
 
 
 @dataclass
@@ -86,7 +129,7 @@ class PreprocessingConfig:
             )
         for scheme in normalization_schemes:
             get_normalizer(scheme)
-        for role in ("image", "label", "mask"):
+        for role in ("image", "mask"):
             axis_orders = getattr(self.resampling, f"{role}_orders")
             if axis_orders is not None and len(axis_orders) != len(spacing):
                 _fail_validation(
@@ -133,8 +176,7 @@ class PreprocessingConfig:
             ),
             resampling=ResamplingConfig(
                 image_order=int(data_kwargs.get("order", 3)),
-                label_order=int(seg_kwargs.get("order", 0)),
-                mask_order=0,
+                mask_order=int(seg_kwargs.get("order", 0)),
             ),
         )
 
@@ -216,6 +258,13 @@ def _validate_interpolation_order(name: str, value: int) -> int:
     return order
 
 
+def _validate_mask_interpolation_order(name: str, value: int) -> int:
+    order = _validate_interpolation_order(name, value)
+    if order not in (0, 1):
+        _fail_validation(f"{name} must be 0 (nearest) or 1 (label-aware linear), got {order}")
+    return order
+
+
 def _normalize_interpolation_orders(
     name: str,
     values: Optional[Sequence[int]],
@@ -225,4 +274,17 @@ def _normalize_interpolation_orders(
     normalized = tuple(_validate_interpolation_order(name, value) for value in values)
     if len(normalized) == 0:
         _fail_validation(f"{name} must contain at least one value when provided")
+    return normalized
+
+
+def _normalize_mask_interpolation_orders(
+    values: Optional[Sequence[int]],
+) -> Optional[Tuple[int, ...]]:
+    if values is None:
+        return None
+    normalized = tuple(
+        _validate_mask_interpolation_order("mask_orders", value) for value in values
+    )
+    if len(normalized) == 0:
+        _fail_validation("mask_orders must contain at least one value when provided")
     return normalized

@@ -25,7 +25,7 @@ dependencies = [
   "nibabel>=4.0.2,<4.1; python_version < '3.8'",
   "nibabel; python_version >= '3.8'",
   "SimpleITK==2.1.1; python_version < '3.8'",
-  "SimpleITK; python_version >= '3.8'",
+  "SimpleITK>=2.3; python_version >= '3.8'",
   "tifffile==2021.11.2; python_version < '3.8'",
   "tifffile; python_version >= '3.8'",
   "scikit-image>=0.19,<0.20; python_version < '3.8'",
